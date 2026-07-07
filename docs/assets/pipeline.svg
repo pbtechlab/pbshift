@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 330" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#8b949e"/>
+    </marker>
+  </defs>
+  <rect x="1" y="1" width="1198" height="328" rx="18" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+  <text x="40" y="50" font-size="24" font-weight="800" fill="#e6edf3">Signal path — one shared front-end, one synthesis loop</text>
+
+  <!-- boxes -->
+  <g font-family="inherit">
+    <g>
+      <rect x="30" y="110" width="104" height="96" rx="11" fill="#161b22" stroke="#30363d"/>
+      <text x="82" y="152" font-size="16" font-weight="700" fill="#e6edf3" text-anchor="middle">input</text>
+      <text x="82" y="174" font-size="12" fill="#8b949e" text-anchor="middle">planar float</text>
+    </g>
+    <g>
+      <rect x="164" y="110" width="150" height="96" rx="11" fill="#161b22" stroke="#30363d"/>
+      <text x="239" y="150" font-size="15" font-weight="700" fill="#e6edf3" text-anchor="middle">pitch resampler</text>
+      <text x="239" y="172" font-size="12" fill="#8b949e" text-anchor="middle">Kaiser-sinc</text>
+      <text x="239" y="190" font-size="12" fill="#8b949e" text-anchor="middle">pre / post placed</text>
+    </g>
+    <g>
+      <rect x="344" y="110" width="188" height="96" rx="11" fill="#0e1726" stroke="#1f6feb" stroke-width="2"/>
+      <text x="438" y="148" font-size="15" font-weight="700" fill="#58a6ff" text-anchor="middle">analysis front-end</text>
+      <text x="438" y="170" font-size="12" fill="#adbac7" text-anchor="middle">reassignment operators</text>
+      <text x="438" y="188" font-size="12" fill="#8b949e" text-anchor="middle">inst. freq · group delay</text>
+    </g>
+    <g>
+      <rect x="562" y="110" width="210" height="96" rx="11" fill="#0e1726" stroke="#1f6feb" stroke-width="2"/>
+      <text x="667" y="146" font-size="15" font-weight="700" fill="#58a6ff" text-anchor="middle">phase + transient engine</text>
+      <text x="667" y="168" font-size="12" fill="#adbac7" text-anchor="middle">identity-locked regions</text>
+      <text x="667" y="186" font-size="12" fill="#adbac7" text-anchor="middle">hold → fire → pin attacks</text>
+    </g>
+    <g>
+      <rect x="802" y="110" width="150" height="96" rx="11" fill="#161b22" stroke="#30363d"/>
+      <text x="877" y="150" font-size="15" font-weight="700" fill="#e6edf3" text-anchor="middle">WOLA synth</text>
+      <text x="877" y="172" font-size="12" fill="#8b949e" text-anchor="middle">weighted overlap-add</text>
+    </g>
+    <g>
+      <rect x="982" y="110" width="104" height="96" rx="11" fill="#132119" stroke="#238636" stroke-width="2"/>
+      <text x="1034" y="152" font-size="16" font-weight="700" fill="#e6edf3" text-anchor="middle">output</text>
+      <text x="1034" y="174" font-size="12" fill="#3fb950" text-anchor="middle">bit-exact</text>
+    </g>
+  </g>
+
+  <!-- arrows -->
+  <g stroke="#8b949e" stroke-width="2" fill="none">
+    <path d="M136,158 L162,158" marker-end="url(#a)"/>
+    <path d="M316,158 L342,158" marker-end="url(#a)"/>
+    <path d="M534,158 L560,158" marker-end="url(#a)"/>
+    <path d="M774,158 L800,158" marker-end="url(#a)"/>
+    <path d="M954,158 L980,158" marker-end="url(#a)"/>
+  </g>
+
+  <!-- notes -->
+  <text x="40" y="256" font-size="14" fill="#8b949e"><tspan font-weight="700" fill="#adbac7">stereo</tspan> — all phase decisions on a reference channel; input inter-channel phase copied verbatim (coherence drift 0.000)</text>
+  <text x="40" y="286" font-size="14" fill="#8b949e"><tspan font-weight="700" fill="#adbac7">deterministic</tspan> — every random value is seeded from the absolute stream position → same input + settings = bit-identical output, any buffer size</text>
+</svg>
