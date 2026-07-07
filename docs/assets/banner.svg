@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#111826"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#58a6ff" stop-opacity="0.0"/>
+      <stop offset="0.5" stop-color="#58a6ff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#3fb950" stop-opacity="0.9"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="1" y="1" width="1198" height="298" rx="18" fill="url(#bg)" stroke="#30363d" stroke-width="2"/>
+
+  <!-- spectral-bars motif, top-right -->
+  <g opacity="0.5">
+    <g fill="url(#wave)">
+      <rect x="770" y="60" width="6" height="26" rx="3"/>
+      <rect x="785" y="48" width="6" height="50" rx="3"/>
+      <rect x="800" y="66" width="6" height="14" rx="3"/>
+      <rect x="815" y="40" width="6" height="66" rx="3"/>
+      <rect x="830" y="56" width="6" height="34" rx="3"/>
+      <rect x="845" y="30" width="6" height="86" rx="3"/>
+      <rect x="860" y="62" width="6" height="22" rx="3"/>
+      <rect x="875" y="46" width="6" height="54" rx="3"/>
+      <rect x="890" y="52" width="6" height="42" rx="3"/>
+      <rect x="905" y="36" width="6" height="74" rx="3"/>
+      <rect x="920" y="64" width="6" height="18" rx="3"/>
+      <rect x="935" y="44" width="6" height="58" rx="3"/>
+      <rect x="950" y="58" width="6" height="30" rx="3"/>
+      <rect x="965" y="34" width="6" height="78" rx="3"/>
+      <rect x="980" y="60" width="6" height="26" rx="3"/>
+      <rect x="995" y="50" width="6" height="46" rx="3"/>
+      <rect x="1010" y="42" width="6" height="62" rx="3"/>
+      <rect x="1025" y="64" width="6" height="18" rx="3"/>
+      <rect x="1040" y="48" width="6" height="50" rx="3"/>
+      <rect x="1055" y="56" width="6" height="34" rx="3"/>
+      <rect x="1070" y="38" width="6" height="70" rx="3"/>
+      <rect x="1085" y="62" width="6" height="22" rx="3"/>
+      <rect x="1100" y="52" width="6" height="42" rx="3"/>
+      <rect x="1115" y="46" width="6" height="54" rx="3"/>
+      <rect x="1130" y="60" width="6" height="26" rx="3"/>
+    </g>
+  </g>
+
+  <!-- title -->
+  <text x="58" y="118" font-size="76" font-weight="800" letter-spacing="-1">
+    <tspan fill="#58a6ff">pb</tspan><tspan fill="#e6edf3">shift</tspan>
+  </text>
+  <text x="62" y="158" font-size="25" fill="#adbac7" font-weight="600">real-time pitch-shift · time-stretch — no trade-offs</text>
+  <text x="62" y="190" font-size="16.5" fill="#8b949e">C++17 · deterministic (bit-exact) · streaming pull API · zero runtime dependencies</text>
+
+  <!-- feature chips -->
+  <g font-size="15" font-weight="600">
+    <g>
+      <rect x="60"  y="228" width="150" height="40" rx="20" fill="#161b22" stroke="#30363d"/>
+      <text x="135" y="253" fill="#e6edf3" text-anchor="middle">pitch ±24 st</text>
+    </g>
+    <g>
+      <rect x="222" y="228" width="150" height="40" rx="20" fill="#161b22" stroke="#30363d"/>
+      <text x="297" y="253" fill="#e6edf3" text-anchor="middle">stretch 0.25×–4×</text>
+    </g>
+    <g>
+      <rect x="384" y="228" width="215" height="40" rx="20" fill="#132119" stroke="#238636"/>
+      <text x="491" y="253" fill="#3fb950" text-anchor="middle">multi-resolution engine</text>
+    </g>
+    <g>
+      <rect x="611" y="228" width="190" height="40" rx="20" fill="#161b22" stroke="#30363d"/>
+      <text x="706" y="253" fill="#e6edf3" text-anchor="middle">formant-preserving</text>
+    </g>
+    <g>
+      <rect x="813" y="228" width="150" height="40" rx="20" fill="#161b22" stroke="#30363d"/>
+      <text x="888" y="253" fill="#e6edf3" text-anchor="middle">stereo-coherent</text>
+    </g>
+  </g>
+</svg>

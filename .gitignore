@@ -1,0 +1,38 @@
+
+# pbhandover
+/HANDOVER.md
+.pbhandover/
+.claude/settings.local.json
+.codex/hooks.json
+
+# vendored/cloned externals (fetch via docs/SETUP.md)
+/third_party/
+# generated
+/benchmarks/corpus/
+/benchmarks/out/
+/tools/bin/
+build/
+*.exe
+*.o
+__pycache__/
+*.pyc
+
+# local-only docs (competitor names / internal comparisons; never push)
+/docs/research/
+/docs/ARCHITECTURE.md
+/docs/multires_results.md
+/docs/SETUP.md
+/docs/BENCHMARKS.md
+
+# internal research tooling + scratch renders
+/tools/extract_research.py
+/benchmarks/chorus/
+
+# comparison harness (local only; other-engine adapters + extended metrics)
+/tools/baseline_*/
+/benchmarks/perceptual.py
+/benchmarks/perceptual_music.py
+/benchmarks/reeval.py
+
+# MUSHRA harness: internal comparison tool, references competitor audio (local only)
+/mushra/
