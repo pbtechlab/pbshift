@@ -412,8 +412,26 @@ struct Stretcher::Impl {
         meanScore /= std::max(1, cnt);
         // voiced confidence: harmonic sum must dominate the mean substantially
         if (bestBin < 0 || bestScore < 2.2 * meanScore) return -1.0;
-        // parabolic refine on the harmonic-sum curve neighbourhood
-        return static_cast<double>(bestBin);
+        // parabolic refine on the harmonic-sum curve neighbourhood: sub-bin F0
+        // localization steadies the fundamental peak p1 in stepVoice (a bin of
+        // F0 jitter jumps the whole harmonic stack -> warble).
+        auto hsum = [&](int f) {
+            double s = 0.0;
+            for (int h = 1; h <= 6; ++h) {
+                const int mb = f * h;
+                if (mb >= B) break;
+                s += R.mag[mb];
+            }
+            return s;
+        };
+        const double y0 = (bestBin > lo) ? hsum(bestBin - 1) : bestScore;
+        const double y1 = bestScore;
+        const double y2 = (bestBin < hi) ? hsum(bestBin + 1) : bestScore;
+        const double denom = (y0 - 2.0 * y1 + y2);
+        double frac = 0.0;
+        if (std::abs(denom) > 1e-18) frac = 0.5 * (y0 - y2) / denom;
+        frac = std::clamp(frac, -0.5, 0.5);
+        return static_cast<double>(bestBin) + frac;
     }
 
     void pushMagHistory(const AnalysisFrame& R) {
@@ -717,6 +735,11 @@ struct Stretcher::Impl {
     bool noTransient = std::getenv("PBSHIFT_NO_TRANSIENT") != nullptr;
     bool noPin = std::getenv("PBSHIFT_NO_PIN") != nullptr;
     bool forceVoice = std::getenv("PBSHIFT_VOICE") != nullptr;
+    // Coherence-locked identity kernel (rebuild each peak region's phase from
+    // the reassignment group delay tau, scaled by alpha, instead of copying the
+    // analysis phase verbatim). Cures the hop-synchronous comb/"fine DelayEcho"
+    // on voice. Opt-in; also used as the non-voiced fallback inside Voice mode.
+    bool forceCoherent = std::getenv("PBSHIFT_COHERENT") != nullptr;
     // measured on the current metric set: phase jitter hurt attack/LTAS and
     // bought nothing on warble — opt-in only until real Noise Morphing lands
     bool noJitter = std::getenv("PBSHIFT_JITTER") == nullptr;
@@ -862,14 +885,15 @@ struct Stretcher::Impl {
             std::fill(jitterAmt.begin(), jitterAmt.end(), 0.0f);
         // Voice mode: shape-invariant harmonic-locked phase on voiced frames
         // (transient frames still take the synchronized reset via stepLocked).
-        // Gated to the pitch-shift-dominant range (alphaUser in [0.9, 1.6]):
-        // measured strongly positive there (voice up-shift MOS +0.3..0.4),
-        // but net-negative under compression and large expansion where
-        // identity-lock already scores high. Only fires in explicit Voice
-        // mode, so the Auto default is unaffected.
+        // Widened to alphaUser in [0.9, 2.5] to cover 2x time-stretch: the hop-
+        // synchronous comb ("fine DelayEcho") that identity-lock leaves on
+        // stretched voice is exactly what harmonic locking removes. Non-voiced
+        // frames within Voice mode take the coherence-locked kernel (not plain
+        // stepLocked) so the whole utterance stays comb-free. Only fires in
+        // explicit Voice mode / PBSHIFT_VOICE, so the Auto default is unaffected.
         const bool voiceMode =
             (cfg.mode == Config::Mode::Voice || forceVoice) && !onset &&
-            alphaUser >= 0.9 && alphaUser <= 1.6;
+            alphaUser >= 0.9 && alphaUser <= 2.5;
         double f0Bin = -1.0;
         if (voiceMode) f0Bin = estimateF0Bin(frames[refCh]);
         if (voiceMode && f0Bin > 0.0) {
@@ -878,6 +902,12 @@ struct Stretcher::Impl {
             pghi->step(frames[refCh], hs, localAlpha,
                        static_cast<uint64_t>(synthCount),
                        onset ? resetMask.data() : nullptr, synthPhase);
+        } else if (forceCoherent || voiceMode) {
+            // coherence-locked identity kernel: explicit opt-in (PBSHIFT_COHERENT
+            // on any mode), or the non-voiced fallback inside Voice mode.
+            pghi->stepLockedCoherent(frames[refCh], hs, localAlpha,
+                                     onset ? resetMask.data() : nullptr,
+                                     synthPhase);
         } else {
             pghi->stepLocked(frames[refCh], hs,
                              onset ? resetMask.data() : nullptr, synthPhase,

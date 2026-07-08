@@ -214,6 +214,83 @@ public:
         finish(cur, outPhase);
     }
 
+    // Coherence-locked identity phase. stepLocked() takes the analysis phase
+    // arg(X[m]) verbatim as each peak region's base, which copies the intra-
+    // window group delay (the pulse-envelope position) unchanged. When the
+    // synthesis hop exceeds the analysis hop (time-stretch), every overlapping
+    // frame then re-deposits the SAME pulse at analysis-hop spacing — a hop-
+    // synchronous comb, heard as a "fine DelayEcho". Here we instead anchor
+    // each region at its peak's time-propagated synthesis phase and rebuild the
+    // phase ACROSS the region from the reassignment group delay tau scaled by
+    // alpha, so the synthesis group delay = alpha * analysis group delay: the
+    // pulse envelope is relocated onto the stretched grid and overlapping
+    // frames reinforce instead of combing (spectrum-wide phase coherence, the
+    // property that keeps a phase-locked vocoder from sounding phasy/echoey).
+    // Reuses the exact alpha*tau frequency propagation from step().
+    void stepLockedCoherent(const AnalysisFrame& cur, int hs, float alpha,
+                            const uint8_t* resetMask,
+                            std::vector<float>& outPhase) {
+        outPhase.resize(bins_);
+        const int B = bins_;
+        float maxMag = 0.0f;
+        for (int m = 0; m < B; ++m)
+            if (cur.mag[m] > maxMag) maxMag = cur.mag[m];
+        const float tol = tolRel_ * maxMag;
+
+        if (!havePrev_) {
+            for (int m = 0; m < B; ++m) outPhase[m] = std::arg(cur.X[m]);
+            finish(cur, outPhase);
+            return;
+        }
+
+        peaks_.clear();
+        for (int m = 1; m + 1 < B; ++m)
+            if (cur.mag[m] > tol && cur.mag[m] >= cur.mag[m - 1] &&
+                cur.mag[m] > cur.mag[m + 1])
+                peaks_.push_back(m);
+
+        if (peaks_.empty()) {
+            for (int m = 0; m < B; ++m) outPhase[m] = std::arg(cur.X[m]);
+            finish(cur, outPhase);
+            return;
+        }
+
+        const float binW = 2.0f * static_cast<float>(M_PI) / (2 * (B - 1));
+        int lo = 0;  // region start (inclusive)
+        for (size_t k = 0; k < peaks_.size(); ++k) {
+            const int p = peaks_[k];
+            int hi = B;  // region end (exclusive)
+            if (k + 1 < peaks_.size()) {
+                int v = p;
+                float vm = cur.mag[p];
+                for (int m = p + 1; m <= peaks_[k + 1]; ++m)
+                    if (cur.mag[m] < vm) { vm = cur.mag[m]; v = m; }
+                hi = v + 1;
+            }
+            // peak's absolute synthesis phase: verbatim on attack reset, else
+            // the time-propagated (trapezoidal omega) running phase.
+            if (resetMask && resetMask[p]) {
+                outPhase[p] = std::arg(cur.X[p]);
+            } else {
+                const double phSyn =
+                    phase_[p] + 0.5 * hs * (static_cast<double>(prevOmega_[p]) +
+                                            cur.omega[p]);
+                outPhase[p] = princarg(phSyn);
+            }
+            // rebuild the region's phase from the (alpha-scaled) group delay,
+            // propagating outward from the peak in both directions.
+            for (int m = p + 1; m < hi; ++m)
+                outPhase[m] = outPhase[m - 1] -
+                    0.5f * binW * alpha * (cur.tau[m - 1] + cur.tau[m]);
+            for (int m = p - 1; m >= lo; --m)
+                outPhase[m] = outPhase[m + 1] +
+                    0.5f * binW * alpha * (cur.tau[m] + cur.tau[m + 1]);
+            lo = hi;
+        }
+        for (int m = lo; m < B; ++m) outPhase[m] = std::arg(cur.X[m]);
+        finish(cur, outPhase);
+    }
+
     // Shape-invariant voice phase (SHIP-style harmonic locking). For voiced
     // frames with a confident F0, the glottal pulse shape is defined by the
     // phase RELATIONSHIP between harmonics: phi_h - h*phi_1 must be preserved.
