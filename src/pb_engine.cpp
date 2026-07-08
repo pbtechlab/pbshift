@@ -92,6 +92,22 @@ struct Stretcher::Impl {
             while (alpha < 0.5 && h / alpha > N / 2 && h > N / 16) h /= 2;
             hs = h;
         }
+        if (!win.w.empty()) buildShortSyn();   // keep L = 2*hs exact if hs changed
+    }
+
+    // Transient short synthesis window (2*hs Hann, centered on N/2) and its
+    // analysis*synthesis product. The dual sig/norm WOLA needs norm += w_ana*w_syn
+    // (NOT w_syn^2) to reconstruct exactly through a non-default window.
+    void buildShortSyn() {
+        shortSyn.assign(N, 0.0f);
+        shortProd.assign(N, 0.0f);
+        const int L = std::min(N, 4 * hs);   // 4x synthesis overlap
+        const int off = (N - L) / 2;         // centered on N/2
+        for (int i = 0; i < L; ++i) {
+            const float w = 0.5f * (1.0f - std::cos(6.28318530717958648f * i / L));
+            shortSyn[off + i] = w;
+            shortProd[off + i] = win.w[off + i] * w;   // analysis x synthesis
+        }
     }
 
     // input ring (per channel), absolute indexing
@@ -158,6 +174,14 @@ struct Stretcher::Impl {
     int histCount = 0;
     std::vector<float> jitterAmt;
 
+    // Multi mode (Music/Rhythm / PBSHIFT_MULTI): transient-adaptive synthesis
+    // window. Analysis stays full-N (tonal frequency resolution); on transient
+    // frames the output is deposited through a narrow 2*hs Hann so the pinned
+    // attack is time-localized (~2*hs) instead of smeared over the full window.
+    std::vector<float> shortSyn, shortProd;  // short synth window + (ana*syn) product
+    bool fShortWin = false;                  // per-frame gate (set in stageDecision)
+    bool multiMode = false;                  // latched in configure()
+
     // formant engine (M6)
     std::vector<std::unique_ptr<TrueEnvelope>> tenv;
     std::vector<float> envLog, fmtGain;
@@ -185,9 +209,20 @@ struct Stretcher::Impl {
                       std::getenv("PBSHIFT_MULTIRES") != nullptr;
         N = nextPow2(static_cast<int>(cfg.sampleRate * winSec));
         if (const char* f = std::getenv("PBSHIFT_FFT")) N = std::atoi(f);
-        hs = N / 4;
+        // Multi mode (Music/Rhythm / PBSHIFT_MULTI): general-purpose transient-
+        // adaptive vocoder. Long analysis window (freq resolution) + permanent
+        // SHORT synthesis window (dual-window WOLA, Portnoff 1976; Allen & Rabiner
+        // 1977) + fine synthesis hop (high overlap) + spectrum-wide identity-
+        // locked coherent phase on every frame (Laroche & Dolson 1999). Latched
+        // before hs so it selects the finer hop. Auto/Voice keep multiMode=false
+        // -> byte-identical default.
+        multiMode = (cfg.mode == Config::Mode::Music ||
+                     cfg.mode == Config::Mode::Rhythm) ||
+                    std::getenv("PBSHIFT_MULTI") != nullptr;
+        hs = multiMode ? N / 8 : N / 4;   // multi: 16x analysis / 4x synth overlap
         if (const char* h = std::getenv("PBSHIFT_HOPDIV")) hs = N / std::atoi(h);
         win = WindowSet::hann(N);
+        buildShortSyn();
         inCap = 1 << 19;
         while (inCap < 8 * N) inCap <<= 1;
         inRing.assign(cfg.channels, std::vector<float>(inCap, 0.0f));
@@ -235,6 +270,7 @@ struct Stretcher::Impl {
         lastOnsetIn = -1e18;
         pendCount = 0;
         pinRemain = 0;
+        fShortWin = false;
         magHist.assign(kHist, std::vector<float>(N / 2 + 1, 0.0f));
         histCount = 0;
         jitterAmt.assign(N / 2 + 1, 0.0f);
@@ -849,7 +885,12 @@ struct Stretcher::Impl {
             // leaks MORE than the pinned path). The pin helps at every ratio
             // it fires; the residual LTAS cost at large expansion is the
             // inherent price of attack-sharpness preservation.
-            if (!voiceish && strongHit && std::abs(debt) < 4.0 * hs)
+            // Multi mode never pins: rate pinning replays the attack at ratio 1.0
+            // across overlapping long analysis windows, so they disagree on where
+            // the transient is -> offset OLA copies = flam/doubling. Sharp single
+            // attacks come instead from coherent phase + the short synthesis
+            // window + partial suppression (no scheduling trick needed).
+            if (!voiceish && !multiMode && strongHit && std::abs(debt) < 4.0 * hs)
                 pinRemain = N / hs;  // this frame + the overlapping ones
         }
         if (pinRemain > 0) {
@@ -878,6 +919,12 @@ struct Stretcher::Impl {
 
         fCOut = synthCount * hs;
         const bool transientActive = onset || pendCount > 0 || pinRemain > 0;
+        // Multi mode: deposit EVERY frame through the short synthesis window (the
+        // classic long-analysis/short-synthesis dual-window split -- discards the
+        // iFFT skirts that spread a phase-modified transient into pre/post echo).
+        // Frame-global via refCh so both stereo channels switch together and the
+        // verbatim inter-channel phase copy holds.
+        fShortWin = multiMode;
         pushMagHistory(frames[refCh]);
         if (!noJitter && !transientActive)
             computeJitter(frames[refCh], alpha);
@@ -902,12 +949,43 @@ struct Stretcher::Impl {
             pghi->step(frames[refCh], hs, localAlpha,
                        static_cast<uint64_t>(synthCount),
                        onset ? resetMask.data() : nullptr, synthPhase);
-        } else if (forceCoherent || voiceMode) {
+        } else if (forceCoherent || voiceMode || multiMode) {
             // coherence-locked identity kernel: explicit opt-in (PBSHIFT_COHERENT
-            // on any mode), or the non-voiced fallback inside Voice mode.
-            pghi->stepLockedCoherent(frames[refCh], hs, localAlpha,
-                                     onset ? resetMask.data() : nullptr,
-                                     synthPhase);
+            // on any mode), Multi mode, or the non-voiced fallback inside Voice.
+            // Multi/coherent tonal frames stay comb-free (stepLockedCoherent);
+            // transient frames take verbatim stepLocked (below) + short window.
+            // Transient frames take the verbatim identity lock instead: the
+            // coherent kernel rebuilds phase from the reassignment group delay
+            // tau, which is ill-defined on broadband non-tonal hits (snare) and
+            // smears the attack/decay into an audible "delay"; stepLocked keeps
+            // the real per-bin phase -> sharp percussive transients.
+            if (transientActive && !multiMode) {
+                // forceCoherent / Voice fallback: verbatim sharp attack.
+                pghi->stepLocked(frames[refCh], hs,
+                                 onset ? resetMask.data() : nullptr, synthPhase,
+                                 noJitter ? nullptr : jitterAmt.data(),
+                                 static_cast<uint64_t>(synthCount) | (1ull << 40));
+            } else {
+                // Multi mode: spectrum-wide coherent phase on EVERY frame (tonal
+                // AND transient) -- relocates each region's group delay onto the
+                // stretched grid so overlapping grains reinforce into one impulse
+                // (no per-region verbatim comb = no snare chorus; identity phase
+                // locking, Laroche & Dolson 1999).
+                // Multi mode passes NO resetMask: a synchronized onset reset makes
+                // the onset frame verbatim while its overlapping neighbours are
+                // not -> the same attack sums at mismatched sub-sample phase =
+                // doubling. Unbroken time-propagated phase continuity instead makes
+                // all overlapping grains place the peak at one instant = 1 impulse.
+                const uint8_t* rm =
+                    (onset && !multiMode) ? resetMask.data() : nullptr;
+                // Region rebuild uses the reassignment group delay (tau); energy-
+                // rising partial suppression collapses a broadband hit onto few
+                // coherent phase centres = one sharp attack.
+                pghi->stepLockedCoherent(frames[refCh], hs, localAlpha, rm,
+                                         synthPhase,
+                                         /*rawPhase=*/false,
+                                         /*suppress=*/multiMode);
+            }
         } else {
             pghi->stepLocked(frames[refCh], hs,
                              onset ? resetMask.data() : nullptr, synthPhase,
@@ -940,7 +1018,10 @@ struct Stretcher::Impl {
         // real-FFT edge bins must stay real
         Y[0] = {std::abs(Y[0]) * (std::cos(std::arg(Y[0])) < 0 ? -1.0f : 1.0f), 0.0f};
         Y[B - 1] = {std::abs(Y[B - 1]) * (std::cos(std::arg(Y[B - 1])) < 0 ? -1.0f : 1.0f), 0.0f};
-        wola[ch]->addFrame(Y.data(), fCOut);
+        if (fShortWin)
+            wola[ch]->addFrame(Y.data(), fCOut, shortSyn.data(), shortProd.data());
+        else
+            wola[ch]->addFrame(Y.data(), fCOut);
     }
 
     long long finalized() const {

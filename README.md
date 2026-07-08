@@ -81,6 +81,17 @@ Notes:
 - Pitch and stretch are fully independent and can be combined (e.g. +7 st at 1.5×).
 - At deep compression the analysis hop is automatically shortened so magnitude evolution is never temporally aliased (no content skipped between frames).
 
+### Multi mode (general-purpose, transient-adaptive)
+
+`Music` / `Rhythm` mode (CLI `--multi`) is a streaming general-purpose path tuned for drums, mixes, and other broadband/percussive material. It reconstructs sharp, single (non-doubled) transients *and* a chorus-free sustain from one mechanism set, with no rate-pinning or onset phase-reset scheduling tricks (which are what leave a flam/echo on stretched drums):
+
+- **Long analysis window, permanent short synthesis window.** The long window keeps frequency resolution; the short synthesis window (dual-window WOLA, Portnoff 1976; Allen & Rabiner 1977) discards the iFFT skirts that would spread a phase-modified transient into pre/post echo. The dual `sig`/`norm` reconstruction stays exact through any window pair.
+- **Spectrum-wide identity-phase-locked coherence on every frame** (Laroche & Dolson 1999), driven by the reassignment **group delay** from the analysis front-end: each valley-to-valley partial region is rebuilt as a rigid body about its peak's time-propagated phase, so overlapping grains reinforce into a single impulse instead of combing.
+- **Energy-rising partial suppression** (cf. transient processing, Röbel 2003): a broadband hit spikes many bins; partials whose energy jumps sharply over the previous frame are merged onto the few strongest coherent centres, so the whole click is governed by a handful of phase centres = one crisp attack rather than a fan of detuned copies.
+- **Unbroken phase continuity** — no onset reset — so all overlapping grains place a transient at one instant. Stereo uses the same verbatim inter-channel phase copy as the default path, so the image is preserved.
+
+Opt-in (`--multi` / `Config::Mode::Music` / `Rhythm`); `Auto` and `Voice` are byte-for-byte unchanged.
+
 ### Multi-resolution time-stretching (offline)
 
 <img src="docs/assets/multires.svg" alt="Multi-resolution: the low band uses a long window for frequency resolution (removes chorusing), the high band uses a short window for time resolution (keeps transients sharp); layout is content-adaptive" width="100%">
@@ -113,7 +124,7 @@ On pbshift's internal objective chorusing metric (1–25 Hz amplitude-modulation
 
 ### Processing modes and tiers
 
-`Config` exposes a mode hint (`Auto` / `Voice` / `Rhythm` / `Music`) and a latency tier (`Live` / `StudioRT` / `Offline`). `StudioRT` is the current reference tier; the dedicated voice engine and the low-latency `Live` tier are active roadmap items (see [Roadmap](#roadmap)).
+`Config` exposes a mode hint (`Auto` / `Voice` / `Rhythm` / `Music`) and a latency tier (`Live` / `StudioRT` / `Offline`). `StudioRT` is the current reference tier. `Music` / `Rhythm` activate the streaming **multi mode** (a general-purpose transient-adaptive path, see [below](#multi-mode-general-purpose-transient-adaptive)); the low-latency `Live` tier is an active roadmap item (see [Roadmap](#roadmap)). `Auto` and `Voice` are byte-for-byte unchanged by the multi-mode path.
 
 ### Channels, sample rates, buffers
 
@@ -283,7 +294,7 @@ For a plugin/insert context, call `feed()` with each host block and `read()` wha
 The repository builds an offline command-line renderer (`tools/bin/pbshift[.exe]`) that doubles as the benchmark-harness adapter:
 
 ```
-pbshift in.wav out.wav [--pitch <semitones>] [--stretch <ratio>] [--formant] [--voice] [--tier live|offline]
+pbshift in.wav out.wav [--pitch <semitones>] [--stretch <ratio>] [--formant] [--voice] [--multi] [--tier live|offline]
 ```
 
 | Option | Meaning | Range |
@@ -292,6 +303,7 @@ pbshift in.wav out.wav [--pitch <semitones>] [--stretch <ratio>] [--formant] [--
 | `--stretch <r>` | Time-stretch ratio = output / input duration | 0.25 … 4 |
 | `--formant` | Enable formant preservation | flag |
 | `--voice` | Voice mode: shape-invariant harmonic-locked phase for speech/vocals | flag |
+| `--multi` | Multi mode: general-purpose transient-adaptive path for drums / mixes | flag |
 | `--tier` | Latency/quality tier: `live` (~64 ms), default (~128 ms), `offline` (~256 ms) | enum |
 
 Examples:

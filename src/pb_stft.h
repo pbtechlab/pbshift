@@ -114,7 +114,17 @@ public:
     // Ring cells ahead of the high-water mark are zeroed lazily here; read()
     // never clears, so a region may be read, then extended by later frames,
     // and read again (needed at the process/flush boundary).
+    // Default full-window path -- forwards so existing 2-arg callers stay
+    // bit-identical (same operands, same order).
     void addFrame(const std::complex<float>* Y, long long center) {
+        addFrame(Y, center, win_.w.data(), wprod_.data());
+    }
+    // Per-frame synthesis window. synProd[i] MUST equal win_.w[i]*synWin[i]
+    // (analysis x synthesis) so the dual sig/norm reconstruction stays exact
+    // for ANY window pair -- lets a transient frame deposit through a narrow
+    // centered window (time-localized attack) without amplitude error.
+    void addFrame(const std::complex<float>* Y, long long center,
+                  const float* synWin, const float* synProd) {
         fft_.inverse(Y, time_);
         const int c = n_ / 2;
         // undo center rotation: unrot[(i + c) mod n] = time[i]
@@ -132,8 +142,8 @@ public:
             const long long p = start + i;
             if (p < 0) continue;
             const int idx = static_cast<int>(p % cap_);
-            sig_[idx] += unrot_[i] * win_.w[i];
-            norm_[idx] += wprod_[i];
+            sig_[idx] += unrot_[i] * synWin[i];
+            norm_[idx] += synProd[i];
         }
     }
 

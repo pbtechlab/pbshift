@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
     double pitch = 0.0, stretch = 1.0;
     bool formant = false;
     bool voiceMode = false;
+    bool multiMode = false;
     std::string tier;
     for (int i = 3; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--pitch") && i + 1 < argc) pitch = std::atof(argv[++i]);
@@ -34,6 +35,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--formant")) formant = true;
         else if (!std::strcmp(argv[i], "--tier") && i + 1 < argc) tier = argv[++i];
         else if (!std::strcmp(argv[i], "--voice")) voiceMode = true;
+        else if (!std::strcmp(argv[i], "--multi")) multiMode = true;
     }
 
     pbwav::AudioFile wav;
@@ -57,6 +59,7 @@ int main(int argc, char** argv) {
     if (tier == "live") cfg.tier = pbshift::Config::Tier::Live;
     else if (tier == "offline") cfg.tier = pbshift::Config::Tier::Offline;
     if (voiceMode) cfg.mode = pbshift::Config::Mode::Voice;
+    else if (multiMode) cfg.mode = pbshift::Config::Mode::Music;  // general transient-adaptive
     pbshift::Stretcher st;
     st.configure(cfg);
     st.setTimeStretch(stretch);

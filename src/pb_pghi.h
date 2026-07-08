@@ -229,7 +229,8 @@ public:
     // Reuses the exact alpha*tau frequency propagation from step().
     void stepLockedCoherent(const AnalysisFrame& cur, int hs, float alpha,
                             const uint8_t* resetMask,
-                            std::vector<float>& outPhase) {
+                            std::vector<float>& outPhase, bool rawPhase = false,
+                            bool suppress = false) {
         outPhase.resize(bins_);
         const int B = bins_;
         float maxMag = 0.0f;
@@ -255,6 +256,30 @@ public:
             return;
         }
 
+        // Energy-rising transient-partial suppression. A broadband hit (snare)
+        // spikes many bins into separate peaks; each would be phase-locked as an
+        // INDEPENDENT partial, and the tiny per-partial phase differences read as
+        // a fan of detuned copies = attack "delay"/chorus. Merge every interior
+        // partial whose energy jumped > k x the previous frame's energy at that
+        // bin into the neighbouring region (drop it as a lock centre), keeping the
+        // single strongest peak and the two spectral edges, so few coherent
+        // centres govern the whole click = one sharp impulse.
+        if (suppress && havePrev_ && peaks_.size() > 2) {
+            int strongest = peaks_[0];
+            for (int p : peaks_)
+                if (cur.mag[p] > cur.mag[strongest]) strongest = p;
+            const float k = 1.5f;
+            supPeaks_.clear();
+            for (size_t i = 0; i < peaks_.size(); ++i) {
+                const int p = peaks_[i];
+                const bool edge = (i == 0 || i + 1 == peaks_.size());
+                const bool rising = cur.mag[p] > k * prevMag_[p];
+                if (p == strongest || edge || !rising)
+                    supPeaks_.push_back(p);  // keep; rising interior peaks drop
+            }
+            peaks_.swap(supPeaks_);
+        }
+
         const float binW = 2.0f * static_cast<float>(M_PI) / (2 * (B - 1));
         int lo = 0;  // region start (inclusive)
         for (size_t k = 0; k < peaks_.size(); ++k) {
@@ -277,14 +302,29 @@ public:
                                             cur.omega[p]);
                 outPhase[p] = princarg(phSyn);
             }
-            // rebuild the region's phase from the (alpha-scaled) group delay,
-            // propagating outward from the peak in both directions.
-            for (int m = p + 1; m < hi; ++m)
-                outPhase[m] = outPhase[m - 1] -
-                    0.5f * binW * alpha * (cur.tau[m - 1] + cur.tau[m]);
-            for (int m = p - 1; m >= lo; --m)
-                outPhase[m] = outPhase[m + 1] +
-                    0.5f * binW * alpha * (cur.tau[m] + cur.tau[m + 1]);
+            // rebuild the region's phase, propagating outward from the peak.
+            if (rawPhase) {
+                // scale the RAW inter-bin phase difference by alpha (mirrors a
+                // shape-invariant frequency-direction integration). Raw phase is
+                // ALWAYS defined, so it relocates the intra-window group delay of
+                // a BROADBAND transient (snare) onto the stretched grid without
+                // the reassignment-tau smear that tau-integration leaves on
+                // non-tonal hits -> sharp, chorus-free percussive attacks.
+                for (int m = p + 1; m < hi; ++m)
+                    outPhase[m] = outPhase[m - 1] +
+                        alpha * princarg(std::arg(cur.X[m]) - std::arg(cur.X[m - 1]));
+                for (int m = p - 1; m >= lo; --m)
+                    outPhase[m] = outPhase[m + 1] -
+                        alpha * princarg(std::arg(cur.X[m + 1]) - std::arg(cur.X[m]));
+            } else {
+                // tonal path: (alpha-scaled) reassignment group delay.
+                for (int m = p + 1; m < hi; ++m)
+                    outPhase[m] = outPhase[m - 1] -
+                        0.5f * binW * alpha * (cur.tau[m - 1] + cur.tau[m]);
+                for (int m = p - 1; m >= lo; --m)
+                    outPhase[m] = outPhase[m + 1] +
+                        0.5f * binW * alpha * (cur.tau[m] + cur.tau[m + 1]);
+            }
             lo = hi;
         }
         for (int m = lo; m < B; ++m) outPhase[m] = std::arg(cur.X[m]);
@@ -426,6 +466,7 @@ private:
     std::vector<float> phase_, prevOmega_, prevMag_;
     std::vector<uint8_t> solved_;
     std::vector<int> peaks_;
+    std::vector<int> supPeaks_;  // scratch for partial suppression
 };
 
 }  // namespace pbshift
