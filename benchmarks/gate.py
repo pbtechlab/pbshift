@@ -17,7 +17,7 @@ import soundfile as sf
 from scipy.signal import butter, sosfiltfilt
 
 INPUT = "Sample/tda_0121_clm_n_f.wav"
-CHAMP = "Sample/tda_0121_2x_pbshift_psola4.wav"  # v4 = current champion to beat
+CHAMP = "Sample/tda_0121_2x_pbshift_v5b.wav"  # v5b (fc=3000 hybrid) = champion
 # Pitch 'n Time Pro (commercial vocal-mode 2x) — the ultimate reference target.
 PNT = "Sample/tda_0121_2x_PnTPro.wav"
 
