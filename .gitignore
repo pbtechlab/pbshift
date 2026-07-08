@@ -36,3 +36,11 @@ __pycache__/
 
 # MUSHRA harness: internal comparison tool, references competitor audio (local only)
 /mushra/
+
+# === session 2026-07-08: never push audio or scratch (WAV embargo) ===
+*.wav
+/sample/
+/Sample/
+/ab_listen/
+/benchmarks/_grid/
+/benchmarks/_dead/
