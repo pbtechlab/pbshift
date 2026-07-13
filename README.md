@@ -83,14 +83,14 @@ Notes:
 
 ### Multi mode (general-purpose, transient-adaptive)
 
-`Music` / `Rhythm` mode (CLI `--multi`) is a streaming general-purpose path tuned for drums, mixes, and other broadband/percussive material. It reconstructs sharp, single (non-doubled) transients *and* a chorus-free sustain from one mechanism set, with no rate-pinning or onset phase-reset scheduling tricks (which are what leave a flam/echo on stretched drums):
+`Music` (CLI `--multi`) and `Rhythm` (CLI `--rhythm`) are streaming paths tuned for mixes and broadband/percussive material. Both use an `N/8` fine frame grid, reconstruct sharp single (non-doubled) transients and chorus-free sustain, and avoid rate-pinning or onset phase-reset scheduling tricks that can leave a flam/echo on stretched drums:
 
-- **Long analysis window, permanent short synthesis window.** The long window keeps frequency resolution; the short synthesis window (dual-window WOLA, Portnoff 1976; Allen & Rabiner 1977) discards the iFFT skirts that would spread a phase-modified transient into pre/post echo. The dual `sig`/`norm` reconstruction stays exact through any window pair.
+- **Long analysis window, content-adaptive synthesis support.** The long window keeps frequency resolution. `Music` retains the full synthesis window on steady tonal frames and switches to a half-length `4*hs` dual window on detected event frames, preserving harmonic purity and stereo stability without spreading attacks. `Rhythm` uses the short window continuously for the sharpest dense percussion. Dual `sig`/`norm` WOLA reconstruction stays normalized through either window.
 - **Spectrum-wide identity-phase-locked coherence on every frame** (Laroche & Dolson 1999), driven by the reassignment **group delay** from the analysis front-end: each valley-to-valley partial region is rebuilt as a rigid body about its peak's time-propagated phase, so overlapping grains reinforce into a single impulse instead of combing.
 - **Energy-rising partial suppression** (cf. transient processing, Röbel 2003): a broadband hit spikes many bins; partials whose energy jumps sharply over the previous frame are merged onto the few strongest coherent centres, so the whole click is governed by a handful of phase centres = one crisp attack rather than a fan of detuned copies.
 - **Unbroken phase continuity** — no onset reset — so all overlapping grains place a transient at one instant. Stereo uses the same verbatim inter-channel phase copy as the default path, so the image is preserved.
 
-Opt-in (`--multi` / `Config::Mode::Music` / `Rhythm`); `Auto` and `Voice` are byte-for-byte unchanged.
+Both paths are opt-in: `--multi` / `Config::Mode::Music`, or `--rhythm` / `Config::Mode::Rhythm`.
 
 ### Multi-resolution time-stretching (offline)
 
@@ -114,7 +114,7 @@ On top of the band split:
 
 On pbshift's internal objective chorusing metric (1–25 Hz amplitude-modulation depth on sustained partials, plus attack-sharpness crest on transients), the multi-resolution engine drives the chorusing measure down across the large majority of signal-class × ratio combinations, with the largest reductions at moderate-to-extreme stretch (2×–4×) — exactly where the chorusing artifact is most audible — and holds sustained tonal, voice, and pure-tone material near the noise floor at every ratio. Reproduce with `benchmarks/ratio_eval.py`.
 
-**Status: opt-in offline path.** The streaming default is unchanged; the multi-resolution engine is a whole-signal (buffered) path, selected via the `Offline` tier (see [CLI usage](#cli-usage)). It is gated behind an explicit switch pending listening-test confirmation, following the project's convention of validating perceptual changes by ear before promoting them to the default. Formant-preserving requests transparently fall back to the streaming engine.
+**Status: opt-in offline path.** The streaming default is unchanged; the multi-resolution engine is a whole-signal (buffered) path selected by combining the `Offline` tier with the explicit `PBSHIFT_MULTIRES` switch (see [CLI usage](#cli-usage)). It remains gated pending listening-test confirmation, following the project's convention of validating perceptual changes by ear before promoting them to the default. Formant-preserving requests transparently fall back to the streaming engine.
 
 ### Formant preservation
 
@@ -124,7 +124,7 @@ On pbshift's internal objective chorusing metric (1–25 Hz amplitude-modulation
 
 ### Processing modes and tiers
 
-`Config` exposes a mode hint (`Auto` / `Voice` / `Rhythm` / `Music`) and a latency tier (`Live` / `StudioRT` / `Offline`). `StudioRT` is the current reference tier. `Music` / `Rhythm` activate the streaming **multi mode** (a general-purpose transient-adaptive path, see [below](#multi-mode-general-purpose-transient-adaptive)); the low-latency `Live` tier is an active roadmap item (see [Roadmap](#roadmap)). `Auto` and `Voice` are byte-for-byte unchanged by the multi-mode path.
+`Config` exposes a mode hint (`Auto` / `Voice` / `Rhythm` / `Music`) and a latency tier (`Live` / `StudioRT` / `Offline`). `StudioRT` is the reference tier. `Music` uses event-adaptive synthesis windows; `Rhythm` keeps the short window active for percussion. `Voice` applies SHIP-style harmonic locking only in its measured 0.9×–1.6× stretch range and uses the coherence-locked kernel outside that range, avoiding the analysis-hop comb found at 2×. `Live` is the implemented low-latency tier.
 
 ### Channels, sample rates, buffers
 
@@ -294,7 +294,7 @@ For a plugin/insert context, call `feed()` with each host block and `read()` wha
 The repository builds an offline command-line renderer (`tools/bin/pbshift[.exe]`) that doubles as the benchmark-harness adapter:
 
 ```
-pbshift in.wav out.wav [--pitch <semitones>] [--stretch <ratio>] [--formant] [--voice] [--multi] [--tier live|offline]
+pbshift in.wav out.wav [--pitch <semitones>] [--stretch <ratio>] [--formant] [--voice|--multi|--rhythm] [--tier live|offline]
 ```
 
 | Option | Meaning | Range |
@@ -303,7 +303,8 @@ pbshift in.wav out.wav [--pitch <semitones>] [--stretch <ratio>] [--formant] [--
 | `--stretch <r>` | Time-stretch ratio = output / input duration | 0.25 … 4 |
 | `--formant` | Enable formant preservation | flag |
 | `--voice` | Voice mode: shape-invariant harmonic-locked phase for speech/vocals | flag |
-| `--multi` | Multi mode: general-purpose transient-adaptive path for drums / mixes | flag |
+| `--multi` | Music mode: mix-oriented path; short synthesis windows only on detected events | flag |
+| `--rhythm` | Rhythm mode: percussion-oriented path with continuously short synthesis windows | flag |
 | `--tier` | Latency/quality tier: `live` (~64 ms), default (~128 ms), `offline` (~256 ms) | enum |
 
 Examples:
@@ -317,7 +318,13 @@ pbshift drums.wav drums_2x.wav --stretch 2.0
 
 # Combined: +7 semitones at 1.5x duration
 pbshift mix.wav mix_p7_s15.wav --pitch 7 --stretch 1.5
+
+# Content-adaptive mix stretch / percussion-priority drum stretch
+pbshift mix.wav mix_2x.wav --stretch 2 --multi
+pbshift drums.wav drums_2x.wav --stretch 2 --rhythm
 ```
+
+The mode flags are mutually exclusive; specify at most one of `--voice`, `--multi`, and `--rhythm`.
 
 Input: WAV (the bundled reader in `tools/common/wav_io.h`). Output: 32-bit float WAV at the input sample rate.
 
@@ -343,7 +350,7 @@ multires mix.wav mix_2x.wav --stretch 2.0
 multires vowel.wav vowel_slow.wav --stretch 1.5 --voice
 ```
 
-The same engine is reachable through the library API by configuring `Config::Tier::Offline` and enabling the multi-resolution path; `Config::Mode::Voice` selects the voiced layout. Pitch shifting still runs through the internal resamplers exactly as on the streaming path.
+The same experimental engine is reachable through the library by selecting `Config::Tier::Offline` and setting `PBSHIFT_MULTIRES` before `configure()`; `Config::Mode::Voice` selects the voiced layout. Formant-preserving requests fall back to the streaming path. Pitch shifting still runs through the internal resamplers.
 
 ## Building
 
@@ -385,11 +392,11 @@ Notes:
 
 ```sh
 cd build
-ctest            # runs core + streaming
+ctest            # runs core + streaming + real-time insert
 # or directly:
 ./test_core
 ./test_streaming
-./rt_bench [block] [stretch] [pitch]   # e.g. ./rt_bench 512 1.0 7
+./rt_bench [block] [stretch] [pitch] [mode]   # e.g. ./rt_bench 512 2.0 0 music
 ```
 
 ## Tests and quality gates
@@ -405,8 +412,8 @@ Every gate below is enforced by an executable test in `tests/` and was passing a
 | Re-render determinism (two runs, same settings) | 0 differing samples | **0 (bit-identical)** |
 
 - `tests/test_core.cpp` — gates 1–3: the analysis/synthesis skeleton must reconstruct a multi-tone input below −120 dB, and the reassignment operators must hit their accuracy targets.
-- `tests/test_streaming.cpp` — gates 4–5: renders the same stereo test signal (tones + clicks) through four conditions (stretch 1.7 / 0.6, pitch ±7 st) with 64-sample and 8192-sample feeds, then byte-compares outputs; also re-renders to verify run-to-run identity.
-- `tests/rt_bench.cpp` — streams stereo audio in host-sized blocks for 30 s and fails if the worst-case block cost exceeds the real-time budget; also prints reported latency.
+- `tests/test_streaming.cpp` — gates 4–5: renders the same stereo signal through four Auto conditions, two Music conditions, Rhythm 2×, and Voice 2× with 64-sample and 8192-sample feeds, then byte-compares outputs and re-renders. It also requires complete target-length output, preserves the Music/Rhythm fine hop across setters, and verifies compression-safe hop recalculation after reset/reconfigure.
+- `tests/rt_bench.cpp` — streams stereo audio in host-sized blocks for 30 s and fails if the worst-case block cost exceeds the real-time budget; the optional fourth argument selects `auto`, `music`, `rhythm`, or `voice` and the result includes reported latency.
 
 ## Benchmark methodology
 
@@ -484,14 +491,15 @@ This property is a hard CI gate, not a best-effort behavior — your offline bou
 ## Latency
 
 - Latency is **fixed** for a given configuration and reported in samples via `inputLatency()` / `outputLatency()` — feed these to your host's plugin delay compensation.
-- The default **Studio-RT** tier uses an analysis window of about 85 ms (4096-point FFT at 48 kHz, 1024-sample synthesis hop), targeting a fixed end-to-end latency in the ~64–90 ms band at 48 kHz.
+- The default **Studio-RT** tier uses a 4096-point analysis window at 48 kHz. `Auto`/`Voice` use a 1024-sample synthesis hop; `Music`/`Rhythm` use the finer 512-sample hop.
+- Reported PDC is `input = N/2`, `output = N/2 + 2*hs`. At 48 kHz this is about **128 ms total** for StudioRT Auto/Voice and **106.7 ms** for StudioRT Music/Rhythm; Live is about **64 ms** and **53.3 ms**, respectively.
 - Designed tiers (`Config::Tier`):
 
 | Tier | Design point | Status |
 |---|---|---|
-| `Live` | shorter asymmetric windows, ~40–58 ms | roadmap |
-| `StudioRT` | ~64–90 ms fixed, ~1 core | current default |
-| `Offline` | quality-first, latency unbounded | roadmap refinements |
+| `Live` | 2048-point window at 48 kHz; lowest streaming latency | implemented |
+| `StudioRT` | 4096-point window; reference real-time quality | current default |
+| `Offline` | 8192-point streaming window or optional whole-signal multi-resolution path | implemented / experimental |
 
 - `rt_bench` prints average / worst-case per-block cost against the real-time budget along with the reported latencies for any block size.
 

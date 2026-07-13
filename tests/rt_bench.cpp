@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "pbshift/pbshift.h"
@@ -16,11 +17,18 @@ int main(int argc, char** argv) {
     const int SR = 48000, ch = 2, BLOCK = argc > 1 ? std::atoi(argv[1]) : 512;
     const double stretch = argc > 2 ? std::atof(argv[2]) : 1.0;
     const double pitch = argc > 3 ? std::atof(argv[3]) : 7.0;
+    const char* mode = argc > 4 ? argv[4] : "auto";
     const int seconds = 30;
 
     pbshift::Config cfg;
     cfg.sampleRate = SR;
     cfg.channels = ch;
+    if (!std::strcmp(mode, "music"))
+        cfg.mode = pbshift::Config::Mode::Music;
+    else if (!std::strcmp(mode, "rhythm"))
+        cfg.mode = pbshift::Config::Mode::Rhythm;
+    else if (!std::strcmp(mode, "voice"))
+        cfg.mode = pbshift::Config::Mode::Voice;
     pbshift::Stretcher st;
     st.configure(cfg);
     st.setTimeStretch(stretch);
@@ -60,9 +68,10 @@ int main(int argc, char** argv) {
         total += ms;
     }
     const double budget = 1000.0 * BLOCK / SR;
-    std::printf("block=%d stretch=%.2f pitch=%+.0f  avg=%.3fms worst=%.3fms "
+    std::printf("block=%d mode=%s stretch=%.2f pitch=%+.0f  "
+                "avg=%.3fms worst=%.3fms "
                 "budget=%.2fms  worst-load=%.1f%%  latency in/out=%d/%d\n",
-                BLOCK, stretch, pitch, total / blocks, worst, budget,
+                BLOCK, mode, stretch, pitch, total / blocks, worst, budget,
                 100.0 * worst / budget, st.inputLatency(), st.outputLatency());
     return worst < budget ? 0 : 1;
 }

@@ -1,5 +1,6 @@
 // pbshift offline CLI (benchmark harness convention):
-//   pbshift in.wav out.wav --pitch <semitones> --stretch <out/in ratio> [--formant]
+//   pbshift in.wav out.wav --pitch <semitones> --stretch <out/in ratio>
+//           [--formant] [--voice|--multi|--rhythm]
 //
 // Pitch = front resampler (Kaiser-sinc, offline quality) + engine stretch
 // (resampler-then-stretch order) until the streaming resampler moves inside
@@ -20,7 +21,8 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "usage: pbshift in.wav out.wav [--pitch st] [--stretch r] [--formant]\n");
+                     "usage: pbshift in.wav out.wav [--pitch st] [--stretch r] "
+                     "[--formant] [--voice|--multi|--rhythm]\n");
         return 1;
     }
     std::string inPath = argv[1], outPath = argv[2];
@@ -28,6 +30,7 @@ int main(int argc, char** argv) {
     bool formant = false;
     bool voiceMode = false;
     bool multiMode = false;
+    bool rhythmMode = false;
     std::string tier;
     for (int i = 3; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--pitch") && i + 1 < argc) pitch = std::atof(argv[++i]);
@@ -36,6 +39,14 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--tier") && i + 1 < argc) tier = argv[++i];
         else if (!std::strcmp(argv[i], "--voice")) voiceMode = true;
         else if (!std::strcmp(argv[i], "--multi")) multiMode = true;
+        else if (!std::strcmp(argv[i], "--rhythm")) rhythmMode = true;
+    }
+    if (static_cast<int>(voiceMode) + static_cast<int>(multiMode) +
+            static_cast<int>(rhythmMode) >
+        1) {
+        std::fprintf(stderr,
+                     "choose at most one of --voice, --multi, and --rhythm\n");
+        return 1;
     }
 
     pbwav::AudioFile wav;
@@ -59,6 +70,7 @@ int main(int argc, char** argv) {
     if (tier == "live") cfg.tier = pbshift::Config::Tier::Live;
     else if (tier == "offline") cfg.tier = pbshift::Config::Tier::Offline;
     if (voiceMode) cfg.mode = pbshift::Config::Mode::Voice;
+    else if (rhythmMode) cfg.mode = pbshift::Config::Mode::Rhythm;
     else if (multiMode) cfg.mode = pbshift::Config::Mode::Music;  // general transient-adaptive
     pbshift::Stretcher st;
     st.configure(cfg);
