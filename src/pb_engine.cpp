@@ -13,6 +13,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include "pb_envelope.h"
@@ -50,14 +52,15 @@ struct Stretcher::Impl {
     std::vector<float*> resPtr;
     std::vector<const float*> cPtr;
 
-    // ---- offline multi-resolution path (opt-in) -------------------------
-    // When enabled (Offline tier + PBSHIFT_MULTIRES), the whole input is
+    // ---- offline multi-resolution path ---------------------------------
+    // Offline Music selects this whole-input path by default;
+    // PBSHIFT_MULTIRES also opts other Offline modes into it. It is
     // buffered and time-stretched by MultiResStretch on finish(): a long
     // window for the low band (frequency resolution, kills chorusing) and a
     // short window for the high band (transient time resolution). Pitch is
     // still handled by the pre/post resamplers exactly as in the streaming
-    // path, so this only replaces the "stretch" middle stage. Default builds
-    // are untouched (useMultiRes stays false).
+    // path, so this only replaces the "stretch" middle stage. Live/StudioRT
+    // remain on the streaming engine; Offline Music enables this by default.
     bool useMultiRes = false;
     std::vector<std::vector<float>> mrIn;   // buffered (pre-resampled) input
     std::vector<std::vector<float>> mrOut;  // stretched (post-resampled) output
@@ -67,6 +70,25 @@ struct Stretcher::Impl {
     // requested, fall back to the streaming engine (which has it). Evaluated
     // lazily because setFormantPreserve() is called after configure().
     bool mrActive() const { return useMultiRes && !formant; }
+
+    // ---- content-adaptive near-unity offline path ----------------------
+    // A single-resolution phase vocoder needlessly reconstructs every sample
+    // when duration differs by only a few percent. Offline Auto/Voice/Music is
+    // quality-first MultiRes; explicit Rhythm uses endpoint-anchored WSOLA for
+    // broadband/transient material and falls back to MultiRes for tonal input.
+    // Multichannel phase stays locked by one shared trajectory/reference.
+    std::vector<std::vector<float>> nearIn;
+    std::vector<std::vector<float>> nearOut;
+    long long nearReadPos = 0;
+    bool nearBuffered = false;
+    bool nearDone = false;
+    bool nearDisabledForStream = false;
+    double nearRatio = 1.0;
+    bool nearUnityEligible() const {
+        return !nearDisabledForStream && cfg.tier == Config::Tier::Offline &&
+               !formant && std::abs(pitchSemi) < 1e-12 &&
+               alphaUser >= 0.97 && alphaUser <= 1.05;
+    }
 
     double pitchFactor() const { return std::pow(2.0, pitchSemi / 12.0); }
     // Deep pitch-down splits the resampling across pre and post stages
@@ -212,8 +234,12 @@ struct Stretcher::Impl {
         double winSec = 0.085;  // -> 4096 @48k
         if (cfg.tier == Config::Tier::Live) winSec = 0.040;      // -> 2048
         else if (cfg.tier == Config::Tier::Offline) winSec = 0.17;  // -> 8192
+        // Offline Music is the public "Multi" quality path: select the true
+        // multi-resolution renderer by default.  The environment switch still
+        // opts other modes into it for experiments/backward compatibility.
         useMultiRes = cfg.tier == Config::Tier::Offline &&
-                      std::getenv("PBSHIFT_MULTIRES") != nullptr;
+                      (cfg.mode == Config::Mode::Music ||
+                       std::getenv("PBSHIFT_MULTIRES") != nullptr);
         N = nextPow2(static_cast<int>(cfg.sampleRate * winSec));
         if (const char* f = std::getenv("PBSHIFT_FFT")) N = std::atoi(f);
         // Multi mode (Music/Rhythm / PBSHIFT_MULTI): general-purpose transient-
@@ -306,6 +332,13 @@ struct Stretcher::Impl {
         mrOut.assign(cfg.channels, {});
         mrReadPos = 0;
         mrDone = false;
+        nearIn.assign(cfg.channels, {});
+        nearOut.assign(cfg.channels, {});
+        nearReadPos = 0;
+        nearBuffered = false;
+        nearDone = false;
+        nearDisabledForStream = false;
+        nearRatio = alphaUser;
         // Re-derive the hop after every configure/reset. This matters when a
         // ratio was changed during the previous stream: setters intentionally
         // do not retime an in-flight frame grid, but the next reset stream must
@@ -334,6 +367,12 @@ struct Stretcher::Impl {
     }
 
     void finishUser() {
+        // A zero-length offline stream has no feed() call on which to latch
+        // the path, so make the same decision here.
+        if (!nearBuffered && totalIn == 0 && nearUnityEligible()) {
+            nearBuffered = true;
+            nearRatio = alphaUser;
+        }
         if (preRatio() != 1.0) {
             resIn->finish();
             const double ratio = preRatio();
@@ -346,6 +385,13 @@ struct Stretcher::Impl {
                     feed(const_cast<const float* const*>(cPtr.data()), made);
                 }
             } while (made > 0);
+        }
+        if (nearBuffered) {
+            if (preferNearMultiRes())
+                runNearMultiRes();
+            else
+                runNearUnity();
+            return;
         }
         if (mrActive()) {
             runMultiRes();
@@ -378,6 +424,11 @@ struct Stretcher::Impl {
     }
 
     int availableUser() {
+        if (nearBuffered) {
+            if (!nearDone) return 0;
+            return (int)std::min<long long>(
+                1 << 30, (long long)nearOut[0].size() - nearReadPos);
+        }
         if (mrActive()) {
             if (!mrDone) return 0;
             return (int)std::min<long long>(
@@ -395,6 +446,16 @@ struct Stretcher::Impl {
     }
 
     int readUser(float* const* out, int nf) {
+        if (nearBuffered) {
+            if (!nearDone) return 0;
+            const long long avail = (long long)nearOut[0].size() - nearReadPos;
+            const int n = (int)std::min<long long>(nf, std::max(0LL, avail));
+            for (int ch = 0; ch < cfg.channels; ++ch)
+                std::memcpy(out[ch], nearOut[ch].data() + nearReadPos,
+                            n * sizeof(float));
+            nearReadPos += n;
+            return n;
+        }
         if (mrActive()) {
             if (!mrDone) return 0;
             const long long avail = (long long)mrOut[0].size() - mrReadPos;
@@ -537,6 +598,16 @@ struct Stretcher::Impl {
     }
 
     void feed(const float* const* in, int nf) {
+        if (nearBuffered || (totalIn == 0 && !fActive && nearUnityEligible())) {
+            if (!nearBuffered) {
+                nearBuffered = true;
+                nearRatio = alphaUser;  // ratio is constant within a stream
+            }
+            for (int ch = 0; ch < cfg.channels; ++ch)
+                nearIn[ch].insert(nearIn[ch].end(), in[ch], in[ch] + nf);
+            totalIn += nf;
+            return;
+        }
         if (mrActive()) {
             // buffer the (already pre-resampled) input; processed on finish
             for (int ch = 0; ch < cfg.channels; ++ch)
@@ -544,13 +615,75 @@ struct Stretcher::Impl {
             totalIn += nf;
             return;
         }
-        for (int ch = 0; ch < cfg.channels; ++ch) {
-            const float* s = in[ch];
-            for (int i = 0; i < nf; ++i)
-                inRing[ch][static_cast<size_t>((totalIn + i) % inCap)] = s[i];
+
+        // Protect both fixed rings from a host that passes an entire file to
+        // feed() before calling available()/read().  The input is admitted in
+        // bounded pieces so pump() can consume it before wraparound, while the
+        // WOLA accumulators are grown once, ahead of synthesis, to retain all
+        // unread output.  External call boundaries still do not affect bits.
+        const long long preserveFrom =
+            postRatio() != 1.0 ? engineHanded : readPos;
+        long long currentOutputEnd = 0;
+        for (const auto& ws : wola)
+            currentOutputEnd = std::max(currentOutputEnd, ws->highWater());
+        // Base this on the CURRENT output high-water plus incremental work,
+        // not absolute input * current ratio.  The latter under-reserved after
+        // an in-flight high->low ratio change because the old 2x output epoch
+        // had already advanced far beyond the recomputed 0.5x estimate.
+        const long double futureIncrement =
+            (static_cast<long double>(nf) + 8LL * N) *
+                std::max(0.02, alpha) +
+            4LL * N;
+        const long double futureOutput =
+            static_cast<long double>(currentOutputEnd) + futureIncrement;
+        const long long requiredEnd = static_cast<long long>(
+            std::min<long double>(
+                futureOutput,
+                static_cast<long double>(
+                    std::numeric_limits<long long>::max())));
+        for (auto& ws : wola)
+            ws->reserveUnread(preserveFrom, requiredEnd);
+
+        constexpr int kSafeFeed = 8192;
+        int offset = 0;
+        while (offset < nf) {
+            const int k = std::min(kSafeFeed, nf - offset);
+            for (int ch = 0; ch < cfg.channels; ++ch) {
+                const float* s = in[ch] + offset;
+                for (int i = 0; i < k; ++i)
+                    inRing[ch][static_cast<size_t>((totalIn + i) % inCap)] = s[i];
+            }
+            totalIn += k;
+            offset += k;
+            pump();
         }
-        totalIn += nf;
-        pump();
+    }
+
+    // A parameter setter may legally arrive after the first feed().  If the
+    // whole-signal near-unity path has already buffered audio, replay that
+    // prefix through the regular engine with the OLD parameters before the
+    // setter is applied.  The remainder of this stream then stays on the
+    // regular path; reset() re-enables near-unity dispatch.  This preserves the
+    // existing in-flight setter semantics instead of silently ignoring pitch,
+    // stretch or formant changes.
+    void fallbackNearToStreaming() {
+        if (!nearBuffered || nearDone) return;
+        std::vector<std::vector<float>> buffered = std::move(nearIn);
+        const long long frames = buffered.empty()
+                                     ? 0
+                                     : (long long)buffered[0].size();
+        resetState();
+        nearDisabledForStream = true;
+        std::vector<const float*> ptr(static_cast<size_t>(cfg.channels));
+        long long fed = 0;
+        while (fed < frames) {
+            const int k = static_cast<int>(
+                std::min<long long>(8192, frames - fed));
+            for (int ch = 0; ch < cfg.channels; ++ch)
+                ptr[static_cast<size_t>(ch)] = buffered[ch].data() + fed;
+            feedUser(ptr.data(), k);
+            fed += k;
+        }
     }
 
     // Resample every channel of `in` by `ratio` through `rs` (streaming
@@ -589,18 +722,439 @@ struct Stretcher::Impl {
         return out;
     }
 
-    // Run the whole-signal multi-resolution stretch (Offline opt-in path).
+    // Shared-channel raw-waveform similarity against the already normalized
+    // OLA overlap.  Each audible channel is normalized independently.
+    double wsolaScore(const std::vector<std::vector<double>>& accum,
+                      const std::vector<double>& norm, long long outPos,
+                      long long inPos, int overlap, int stride) const {
+        std::vector<double> scores(static_cast<size_t>(cfg.channels), 0.0);
+        std::vector<double> levels(static_cast<size_t>(cfg.channels), 0.0);
+        double maxLevel = 0.0;
+        for (int ch = 0; ch < cfg.channels; ++ch) {
+            double ab = 0.0, aa = 0.0, bb = 0.0;
+            const auto& a = accum[ch];
+            const auto& b = nearIn[ch];
+            for (int i = 0; i < overlap; i += stride) {
+                const size_t oi = static_cast<size_t>(outPos + i);
+                const double av = norm[oi] > 1e-20 ? a[oi] / norm[oi] : 0.0;
+                const double bv = b[static_cast<size_t>(inPos + i)];
+                ab += av * bv;
+                aa += av * av;
+                bb += bv * bv;
+            }
+            const double rawDen = std::sqrt(aa * bb);
+            const double raw = rawDen > 1e-20 ? ab / rawDen : 0.0;
+            scores[static_cast<size_t>(ch)] = raw;
+            levels[static_cast<size_t>(ch)] = std::max(aa, bb);
+            maxLevel = std::max(maxLevel, levels[static_cast<size_t>(ch)]);
+        }
+
+        // Normalize each audible channel independently before averaging.  A
+        // loud centre channel must not be allowed to hide a bad splice in a
+        // quieter ambience/rear channel.  The relative -60 dB energy gate
+        // rejects only channels that are effectively digital silence.
+        const double gate = std::max(1e-20, maxLevel * 1e-6);
+        double sum = 0.0;
+        int active = 0;
+        for (int ch = 0; ch < cfg.channels; ++ch) {
+            if (levels[static_cast<size_t>(ch)] >= gate) {
+                sum += scores[static_cast<size_t>(ch)];
+                ++active;
+            }
+        }
+        return active > 0 ? sum / active : 0.0;
+    }
+
+    bool wsolaTransient(long long start, int length) const {
+        for (int ch = 0; ch < cfg.channels; ++ch) {
+            double energy = 0.0;
+            double peak = 0.0;
+            const auto& x = nearIn[ch];
+            for (int i = 0; i < length; ++i) {
+                const double v = x[static_cast<size_t>(start + i)];
+                energy += v * v;
+                peak = std::max(peak, std::abs(v));
+            }
+            const double rms = std::sqrt(energy / std::max(1, length));
+            if (peak > 1e-5 && peak > 6.0 * (rms + 1e-15)) return true;
+        }
+        return false;
+    }
+
+    bool preferNearMultiRes() const {
+        if (nearIn.empty() ||
+            llround(nearIn[0].size() * nearRatio) ==
+                static_cast<long long>(nearIn[0].size()))
+            return false;
+
+        // A short clip has no safe WSOLA grid. Resampling it by endpoint
+        // interpolation changes pitch by the stretch ratio, so every
+        // non-trivial short render goes through the pitch-preserving spectral
+        // renderer regardless of the requested content mode.
+        if (nearIn[0].size() < static_cast<size_t>(cfg.sampleRate / 20))
+            return true;
+
+        // Offline Auto/Voice are quality-first whole-signal modes.  Keep the
+        // absolute-grid WSOLA branch for explicit Rhythm/broadband work, where
+        // transient timing is its measured advantage; this prevents an
+        // unclassified low tonal bed from ever taking the risky path.
+        if (cfg.mode != Config::Mode::Rhythm) return true;
+
+        std::vector<double> energies(static_cast<size_t>(cfg.channels), 0.0);
+        double bestEnergy = 0.0;
+        for (int ch = 0; ch < cfg.channels; ++ch) {
+            for (float s : nearIn[ch])
+                energies[static_cast<size_t>(ch)] +=
+                    static_cast<double>(s) * s;
+            bestEnergy = std::max(bestEnergy,
+                                  energies[static_cast<size_t>(ch)]);
+        }
+        // Absolute-grid WSOLA is strongest on broadband/transient mixtures.
+        // Sustained tonal material exposes every splice as modulation; the
+        // multi-resolution renderer is objectively cleaner there. Inspect
+        // every audible channel independently so a loud broadband channel
+        // cannot make a -40 dB tonal ambience/bass channel take the wrong path.
+        for (int ch = 0; ch < cfg.channels; ++ch) {
+            if (energies[static_cast<size_t>(ch)] < bestEnergy * 1e-6)
+                continue;
+            const double flat =
+                MultiResStretch::spectralFlatness(nearIn[ch]);
+            const double periodic =
+                MultiResStretch::periodicity(nearIn[ch], cfg.sampleRate);
+            if (flat < 0.02 && periodic > 0.40) return true;
+        }
+        return false;
+    }
+
+    int loudestChannel(
+        const std::vector<std::vector<float>>& audio) const {
+        int loudRef = 0;
+        double loudEnergy = -1.0;
+        for (int ch = 0; ch < static_cast<int>(audio.size()); ++ch) {
+            double energy = 0.0;
+            for (float s : audio[static_cast<size_t>(ch)])
+                energy += static_cast<double>(s) * s;
+            if (energy > loudEnergy) {
+                loudEnergy = energy;
+                loudRef = ch;
+            }
+        }
+        return loudRef;
+    }
+
+    void rerenderQuietIndependentTonal(
+        const std::vector<std::vector<float>>& input,
+        std::vector<std::vector<float>>& output, int loudRef,
+        double renderRatio, double layoutRatio) const {
+        if (loudRef < 0 || loudRef >= static_cast<int>(input.size()) ||
+            output.size() != input.size())
+            return;
+
+        std::vector<double> energies(input.size(), 0.0);
+        for (size_t ch = 0; ch < input.size(); ++ch)
+            for (float s : input[ch])
+                energies[ch] += static_cast<double>(s) * s;
+        const double loudEnergy = energies[static_cast<size_t>(loudRef)];
+        if (loudEnergy <= 1e-20) return;
+
+        // A tonal reference may have a legitimate low-level quadrature or
+        // delayed partner whose zero-lag correlation is small. Keep that whole
+        // stereo image locked; the independent fallback is only for a quiet
+        // tonal bed underneath a broadband reference.
+        if (MultiResStretch::spectralFlatness(
+                input[static_cast<size_t>(loudRef)]) < 0.02 &&
+            MultiResStretch::periodicity(
+                input[static_cast<size_t>(loudRef)], cfg.sampleRate) > 0.40)
+            return;
+
+        // A single reference preserves a correlated stereo image, but it can
+        // modulate an unrelated tonal bed that is tens of dB below a broadband
+        // channel. Render only that narrow corner independently. Ordinary
+        // stereo pairs (including opposite polarity) remain phase-locked.
+        for (int ch = 0; ch < static_cast<int>(input.size()); ++ch) {
+            if (ch == loudRef) continue;
+            const double energy = energies[static_cast<size_t>(ch)];
+            if (energy < loudEnergy * 1e-6 || energy >= loudEnergy * 0.01)
+                continue;
+            double dot = 0.0;
+            const size_t count = std::min(input[static_cast<size_t>(ch)].size(),
+                                          input[static_cast<size_t>(loudRef)].size());
+            for (size_t i = 0; i < count; ++i)
+                dot += static_cast<double>(input[static_cast<size_t>(ch)][i]) *
+                       input[static_cast<size_t>(loudRef)][i];
+            const double correlation = std::abs(dot) /
+                std::sqrt(std::max(1e-30, energy * loudEnergy));
+            if (correlation >= 0.5 ||
+                MultiResStretch::spectralFlatness(
+                    input[static_cast<size_t>(ch)]) >= 0.02 ||
+                MultiResStretch::periodicity(
+                    input[static_cast<size_t>(ch)], cfg.sampleRate) <= 0.40)
+                continue;
+
+            bool pin = true;
+            std::vector<MultiResStretch::Scale> scales;
+            if (cfg.mode == Config::Mode::Voice) {
+                scales = MultiResStretch::voicedScales(layoutRatio);
+                pin = false;
+            } else {
+                scales = MultiResStretch::autoScales(
+                    input[static_cast<size_t>(ch)], cfg.sampleRate, &pin,
+                    layoutRatio);
+            }
+            MultiResStretch renderer(cfg.sampleRate, scales, pin);
+            std::vector<std::vector<float>> mono{
+                input[static_cast<size_t>(ch)]};
+            auto rendered = renderer.process(mono, renderRatio);
+            if (rendered.size() != 1 ||
+                rendered[0].size() != output[static_cast<size_t>(ch)].size())
+                throw std::runtime_error(
+                    "pbshift independent-channel length underflow");
+            output[static_cast<size_t>(ch)] = std::move(rendered[0]);
+        }
+    }
+
+    // Buffered Offline fallback for sustained tonal material.  The actual
+    // multi-resolution renderer measures markedly cleaner than forcing WSOLA
+    // period choices on low fundamentals.  Unlike the streaming-PV fallback,
+    // it natively owns exact whole-signal length and cannot hide underflow by
+    // returning a pre-zeroed tail.
+    void runNearMultiRes() {
+        const long long inputFrames = nearIn.empty()
+                                          ? 0
+                                          : (long long)nearIn[0].size();
+        const long long target =
+            std::max(0LL, llround(inputFrames * nearRatio));
+        const int loudRef = loudestChannel(nearIn);
+        bool pin = true;
+        std::vector<MultiResStretch::Scale> scales;
+        if (cfg.mode == Config::Mode::Voice) {
+            scales = MultiResStretch::voicedScales(nearRatio);
+            pin = false;
+        } else {
+            scales = MultiResStretch::autoScales(
+                nearIn[loudRef], cfg.sampleRate, &pin, nearRatio);
+        }
+        MultiResStretch renderer(cfg.sampleRate, scales, pin);
+        // MultiResStretch uses channel 0 for phase/onset decisions. Put the
+        // loudest channel there temporarily: a silent left channel must not
+        // make an active right channel inherit an undefined phase trajectory.
+        if (loudRef != 0)
+            std::swap(nearIn[0], nearIn[static_cast<size_t>(loudRef)]);
+        try {
+            nearOut = renderer.process(nearIn, nearRatio);
+        } catch (...) {
+            if (loudRef != 0)
+                std::swap(nearIn[0], nearIn[static_cast<size_t>(loudRef)]);
+            throw;
+        }
+        if (loudRef != 0) {
+            std::swap(nearIn[0], nearIn[static_cast<size_t>(loudRef)]);
+            if (nearOut.size() > static_cast<size_t>(loudRef))
+                std::swap(nearOut[0],
+                          nearOut[static_cast<size_t>(loudRef)]);
+        }
+        rerenderQuietIndependentTonal(nearIn, nearOut, loudRef, nearRatio,
+                                      nearRatio);
+        if (static_cast<int>(nearOut.size()) != cfg.channels)
+            throw std::runtime_error("pbshift near-unity channel underflow");
+        for (int ch = 0; ch < cfg.channels; ++ch) {
+            auto& channel = nearOut[ch];
+            if (static_cast<long long>(channel.size()) != target)
+                throw std::runtime_error("pbshift near-unity length underflow");
+            double inEnergy = 0.0, outEnergy = 0.0;
+            for (float s : nearIn[ch]) inEnergy += static_cast<double>(s) * s;
+            for (float s : channel) outEnergy += static_cast<double>(s) * s;
+            if (inEnergy > 1e-20 && outEnergy > 1e-20) {
+                const double gain = std::sqrt(
+                    (inEnergy / inputFrames) / (outEnergy / target));
+                for (float& s : channel) s = static_cast<float>(s * gain);
+            }
+        }
+        nearReadPos = 0;
+        nearDone = true;
+        finished = true;
+    }
+
+    void runNearUnity() {
+        const long long inputFrames = nearIn.empty()
+                                          ? 0
+                                          : (long long)nearIn[0].size();
+        const long long target =
+            std::max(0LL, llround(inputFrames * nearRatio));
+        nearOut.assign(cfg.channels, {});
+        for (auto& y : nearOut) y.reserve(static_cast<size_t>(target));
+
+        if (inputFrames == 0 || target == 0) {
+            nearDone = true;
+            finished = true;
+            return;
+        }
+
+        // This is the continuity anchor: unity (and ratios whose rounded
+        // target is identical) is a literal copy, not a reconstruction.
+        if (target == inputFrames) {
+            nearOut = nearIn;
+            nearDone = true;
+            finished = true;
+            return;
+        }
+
+        const int nominalWindow = std::clamp(
+            static_cast<int>(llround(cfg.sampleRate * 0.040)), 32, 32768);
+        if (inputFrames <= nominalWindow || target <= nominalWindow ||
+            target < 2) {
+            // Defensive fallback if this function is called directly: never
+            // turn a time stretch into pitch-changing interpolation.
+            runNearMultiRes();
+            return;
+        }
+
+        // Endpoint-anchored absolute-grid WSOLA.  Synthesis starts are spread
+        // uniformly rather than appending a tiny remainder frame, which gives
+        // both ends a protected ~10 ms single-frame region.  Analysis nominal
+        // positions use the same endpoint affine map; similarity search is
+        // always relative to that absolute grid and cannot accumulate drift.
+        const int window = nominalWindow;
+        const int nominalHop = std::clamp(
+            static_cast<int>(llround(cfg.sampleRate * 0.010)), 8, 8192);
+        const long long outSpan = target - window;
+        const long long inSpan = inputFrames - window;
+        const long long intervals = std::max(
+            1LL, (outSpan + nominalHop - 1) / nominalHop);
+        const int search = std::clamp(
+            static_cast<int>(llround(cfg.sampleRate * 0.010)), 16, 8192);
+        const int coarseStep = std::clamp(cfg.sampleRate / 12000, 1, 32);
+        const int fineStride = 1;
+
+        std::vector<double> win(static_cast<size_t>(window));
+        for (int i = 0; i < window; ++i)
+            win[static_cast<size_t>(i)] =
+                0.5 - 0.5 * std::cos(2.0 * M_PI * (i + 0.5) / window);
+        std::vector<std::vector<double>> accum(
+            cfg.channels, std::vector<double>(static_cast<size_t>(target), 0.0));
+        std::vector<double> norm(static_cast<size_t>(target), 0.0);
+
+        long long previousIn = 0;
+        long long previousOut = 0;
+        long long covered = 0;
+        for (long long k = 0; k <= intervals; ++k) {
+            const long long outStart = llround(
+                static_cast<long double>(k) * outSpan / intervals);
+            const long long nominal = llround(
+                static_cast<long double>(k) * inSpan / intervals);
+            long long chosen = nominal;
+
+            if (k != 0 && k != intervals) {
+                long long lo = std::max(0LL, nominal - search);
+                long long hi = std::min(inSpan, nominal + search);
+                // Preserve source order.  With near-unity ratios the absolute
+                // corridor always has ample room; this guard also makes odd
+                // tiny/sample-rate configurations deterministic.
+                const long long minAdvance = std::max(
+                    1LL, (outStart - previousOut) / 4);
+                if (previousIn + minAdvance <= hi)
+                    lo = std::max(lo, previousIn + minAdvance);
+                hi = std::min(hi, previousIn + window - 1);
+
+                const int overlap = static_cast<int>(
+                    std::max(0LL, std::min(covered, outStart + window) -
+                                      outStart));
+                if (wsolaTransient(nominal, window)) {
+                    // Coded impulses/percussion stay on the uniform map so a
+                    // similarity offset cannot duplicate or skip the event.
+                    chosen = std::clamp(nominal, lo, hi);
+                } else {
+                    long long best = std::clamp(nominal, lo, hi);
+                    double bestScore = -1e30;
+                    auto consider = [&](long long p, int stride) {
+                        const double corr = wsolaScore(
+                            accum, norm, outStart, p, overlap, stride);
+                        // A modest absolute-grid prior breaks near-equal
+                        // periodic matches in favour of correct time mapping,
+                        // while still allowing a true waveform period to win.
+                        const double score = corr -
+                            0.03 * std::abs(p - nominal) /
+                                std::max(1, search);
+                        if (score > bestScore) {
+                            bestScore = score;
+                            best = p;
+                        }
+                    };
+                    for (long long p = lo; p <= hi; p += coarseStep)
+                        consider(p, coarseStep);
+                    consider(hi, coarseStep);
+                    consider(std::clamp(nominal, lo, hi), coarseStep);
+                    const long long refineLo =
+                        std::max(lo, best - 2LL * coarseStep);
+                    const long long refineHi =
+                        std::min(hi, best + 2LL * coarseStep);
+                    bestScore = -1e30;
+                    for (long long p = refineLo; p <= refineHi; ++p)
+                        consider(p, fineStride);
+                    chosen = best;
+                }
+            }
+
+            for (int i = 0; i < window; ++i) {
+                const size_t oi = static_cast<size_t>(outStart + i);
+                const double w = win[static_cast<size_t>(i)];
+                norm[oi] += w;
+                for (int ch = 0; ch < cfg.channels; ++ch)
+                    accum[ch][oi] +=
+                        nearIn[ch][static_cast<size_t>(chosen + i)] * w;
+            }
+            covered = std::max(covered, outStart + window);
+            previousIn = chosen;
+            previousOut = outStart;
+        }
+
+        nearOut.assign(cfg.channels,
+                       std::vector<float>(static_cast<size_t>(target), 0.0f));
+        for (int ch = 0; ch < cfg.channels; ++ch)
+            for (long long i = 0; i < target; ++i)
+                nearOut[ch][static_cast<size_t>(i)] =
+                    norm[static_cast<size_t>(i)] > 1e-20
+                        ? static_cast<float>(
+                              accum[ch][static_cast<size_t>(i)] /
+                              norm[static_cast<size_t>(i)])
+                        : 0.0f;
+        // Make the protected single-frame head/tail literal even in the
+        // presence of final float rounding.  Uniform frame spacing guarantees
+        // this region is about one synthesis hop, never a one-sample remainder.
+        const long long protectedFrames = std::min<long long>(
+            {inputFrames, target,
+             std::max(1LL, llround(
+                 static_cast<long double>(outSpan) / intervals))});
+        for (int ch = 0; ch < cfg.channels; ++ch) {
+            for (long long i = 0; i < protectedFrames; ++i) {
+                nearOut[ch][static_cast<size_t>(i)] =
+                    nearIn[ch][static_cast<size_t>(i)];
+                nearOut[ch][static_cast<size_t>(target - protectedFrames + i)] =
+                    nearIn[ch][static_cast<size_t>(inputFrames -
+                                                    protectedFrames + i)];
+            }
+        }
+
+        nearDone = true;
+        finished = true;
+    }
+
+    // Run the whole-signal multi-resolution stretch (Offline Music default,
+    // or explicit opt-in for the other modes).
     void runMultiRes() {
         std::vector<MultiResStretch::Scale> scales;
         bool pin = true;
+        const int loudRef = loudestChannel(mrIn);
         if (cfg.mode == Config::Mode::Voice) {
             scales = MultiResStretch::voicedScales(alphaUser);
             pin = false;
         } else {
             // content-adaptive: percussion -> single window, tone -> long
-            // window, tonal mix -> multi-resolution (detected on channel 0)
+            // window, tonal mix -> multi-resolution (detected on the loudest
+            // channel, which is also used as the phase/onset reference below)
             scales = MultiResStretch::autoScales(
-                mrIn.empty() ? std::vector<float>() : mrIn[0],
+                mrIn.empty() ? std::vector<float>()
+                             : mrIn[static_cast<size_t>(loudRef)],
                 cfg.sampleRate, &pin, alphaUser);
         }
         MultiResStretch mr(cfg.sampleRate, scales, pin);
@@ -608,7 +1162,21 @@ struct Stretcher::Impl {
         // resamplers convert the pitchFactor part into the actual pitch shift)
         const double engineStretch =
             std::clamp(alphaUser * pitchFactor(), 0.02, 64.0);
-        std::vector<std::vector<float>> y = mr.process(mrIn, engineStretch);
+        if (loudRef != 0)
+            std::swap(mrIn[0], mrIn[static_cast<size_t>(loudRef)]);
+        std::vector<std::vector<float>> y;
+        try {
+            y = mr.process(mrIn, engineStretch);
+        } catch (...) {
+            if (loudRef != 0)
+                std::swap(mrIn[0], mrIn[static_cast<size_t>(loudRef)]);
+            throw;
+        }
+        if (loudRef != 0) {
+            std::swap(mrIn[0], mrIn[static_cast<size_t>(loudRef)]);
+            if (y.size() > static_cast<size_t>(loudRef))
+                std::swap(y[0], y[static_cast<size_t>(loudRef)]);
+        }
         if (postRatio() != 1.0)
             mrOut = resampleAll(resOut.get(), y, postRatio());
         else
@@ -1059,14 +1627,21 @@ void Stretcher::configure(const Config& cfg) { impl_->configure(cfg); }
 void Stretcher::reset() { impl_->resetState(); }
 
 void Stretcher::setTimeStretch(double ratio) {
-    impl_->alphaUser = std::clamp(ratio, 0.05, 20.0);
+    const double value = std::clamp(ratio, 0.05, 20.0);
+    if (value != impl_->alphaUser) impl_->fallbackNearToStreaming();
+    impl_->alphaUser = value;
     impl_->updateAlpha();
 }
 void Stretcher::setPitchSemitones(double s) {
-    impl_->pitchSemi = std::clamp(s, -24.0, 24.0);
+    const double value = std::clamp(s, -24.0, 24.0);
+    if (value != impl_->pitchSemi) impl_->fallbackNearToStreaming();
+    impl_->pitchSemi = value;
     impl_->updateAlpha();
 }
-void Stretcher::setFormantPreserve(bool e) { impl_->formant = e; }
+void Stretcher::setFormantPreserve(bool e) {
+    if (e != impl_->formant) impl_->fallbackNearToStreaming();
+    impl_->formant = e;
+}
 
 void Stretcher::feed(const float* const* in, int frames) {
     impl_->feedUser(in, frames);

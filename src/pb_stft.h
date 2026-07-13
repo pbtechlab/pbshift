@@ -5,6 +5,7 @@
 // sits at index 0 before the FFT ("center-referenced" phases). This makes
 // phase gradients well-conditioned and hop-independent.
 #pragma once
+#include <stdexcept>
 #include <complex>
 #include <vector>
 
@@ -94,7 +95,7 @@ private:
 // exact amplitude normalization for any hop and at stream edges.
 class WolaSynth {
 public:
-    WolaSynth(int fftSize, const WindowSet& win, int capacity)
+    WolaSynth(int fftSize, const WindowSet& win, size_t capacity)
         : n_(fftSize), fft_(fftSize), win_(win),
           sig_(capacity, 0.0f), norm_(capacity, 0.0f), cap_(capacity) {
         time_ = RealFFT::alloc(n_);
@@ -133,7 +134,8 @@ public:
         const long long start = center - c;
         const long long end = start + n_;
         for (long long p = highWater_; p < end; ++p) {
-            const int idx = static_cast<int>(p % cap_);
+            const size_t idx = static_cast<size_t>(
+                p % static_cast<long long>(cap_));
             sig_[idx] = 0.0f;
             norm_[idx] = 0.0f;
         }
@@ -141,7 +143,8 @@ public:
         for (int i = 0; i < n_; ++i) {
             const long long p = start + i;
             if (p < 0) continue;
-            const int idx = static_cast<int>(p % cap_);
+            const size_t idx = static_cast<size_t>(
+                p % static_cast<long long>(cap_));
             sig_[idx] += unrot_[i] * synWin[i];
             norm_[idx] += synProd[i];
         }
@@ -155,7 +158,8 @@ public:
                 out[i] = 0.0f;
                 continue;
             }
-            const int idx = static_cast<int>(p % cap_);
+            const size_t idx = static_cast<size_t>(
+                p % static_cast<long long>(cap_));
             const float nrm = norm_[idx];
             out[i] = nrm > 1e-9f ? sig_[idx] / nrm : 0.0f;
         }
@@ -167,13 +171,52 @@ public:
         highWater_ = 0;
     }
 
+    long long highWater() const { return highWater_; }
+
+    // Grow the circular accumulator before a host submits a large block
+    // without draining output.  `preserveFrom` is the oldest absolute sample
+    // the engine may still read and `requiredEnd` is a conservative future
+    // high-water mark.  Re-indexing by absolute position preserves every
+    // accumulated bit; ordinary real-time streams stay on the original fixed
+    // allocation and never enter this path.
+    void reserveUnread(long long preserveFrom, long long requiredEnd) {
+        preserveFrom = std::max(0LL, preserveFrom);
+        const long long needed = std::max(0LL, requiredEnd - preserveFrom);
+        if (static_cast<unsigned long long>(needed) >
+            static_cast<unsigned long long>(sig_.max_size()))
+            throw std::length_error("pbshift WOLA unread output is too large");
+        if (static_cast<size_t>(needed) <= cap_) return;
+
+        size_t newCap = cap_;
+        while (newCap < static_cast<size_t>(needed)) {
+            if (newCap > sig_.max_size() / 2) {
+                newCap = static_cast<size_t>(needed);
+                break;
+            }
+            newCap *= 2;
+        }
+        std::vector<float> newSig(newCap, 0.0f);
+        std::vector<float> newNorm(newCap, 0.0f);
+        for (long long p = preserveFrom; p < highWater_; ++p) {
+            const size_t oldIdx = static_cast<size_t>(
+                p % static_cast<long long>(cap_));
+            const size_t newIdx = static_cast<size_t>(
+                p % static_cast<long long>(newCap));
+            newSig[newIdx] = sig_[oldIdx];
+            newNorm[newIdx] = norm_[oldIdx];
+        }
+        sig_.swap(newSig);
+        norm_.swap(newNorm);
+        cap_ = newCap;
+    }
+
 private:
     int n_;
     RealFFT fft_;
     const WindowSet& win_;
     std::vector<float> sig_, norm_;
     std::vector<float> wprod_;
-    int cap_;
+    size_t cap_;
     long long highWater_ = 0;
     float* time_;
     float* unrot_;

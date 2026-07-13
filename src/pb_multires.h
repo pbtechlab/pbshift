@@ -180,9 +180,14 @@ public:
             AnalysisFrontend fe(N, win);
             const long long cap = nOut + 4LL * N;
             std::vector<std::unique_ptr<WolaSynth>> wola;
-            for (int c = 0; c < C; ++c)
+            for (int c = 0; c < C; ++c) {
                 wola.emplace_back(new WolaSynth(
                     N, win, (int)std::min<long long>(cap, 1LL << 26)));
+                // The constructor's moderate initial allocation keeps normal
+                // renders cheap; whole-signal Offline output must nevertheless
+                // retain every sample even beyond the historical 2^26 cap.
+                wola.back()->reserveUnread(0, cap);
+            }
             Rtpghi pghi(B);                             // ref-channel phase
             std::vector<AnalysisFrame> frames(C);
             std::vector<float> synthPhase;

@@ -83,20 +83,20 @@ Notes:
 
 ### Multi mode (general-purpose, transient-adaptive)
 
-`Music` (CLI `--multi`) and `Rhythm` (CLI `--rhythm`) are streaming paths tuned for mixes and broadband/percussive material. Both use an `N/8` fine frame grid, reconstruct sharp single (non-doubled) transients and chorus-free sustain, and avoid rate-pinning or onset phase-reset scheduling tricks that can leave a flam/echo on stretched drums:
+In the `Live` and `StudioRT` tiers, `Music` (CLI `--multi`) and `Rhythm` (CLI `--rhythm`) are streaming paths tuned for mixes and broadband/percussive material. Both use an `N/8` fine frame grid, reconstruct sharp single (non-doubled) transients and chorus-free sustain, and avoid rate-pinning or onset phase-reset scheduling tricks that can leave a flam/echo on stretched drums:
 
 - **Long analysis window, content-adaptive synthesis support.** The long window keeps frequency resolution. `Music` retains the full synthesis window on steady tonal frames and switches to a half-length `4*hs` dual window on detected event frames, preserving harmonic purity and stereo stability without spreading attacks. `Rhythm` uses the short window continuously for the sharpest dense percussion. Dual `sig`/`norm` WOLA reconstruction stays normalized through either window.
 - **Spectrum-wide identity-phase-locked coherence on every frame** (Laroche & Dolson 1999), driven by the reassignment **group delay** from the analysis front-end: each valley-to-valley partial region is rebuilt as a rigid body about its peak's time-propagated phase, so overlapping grains reinforce into a single impulse instead of combing.
 - **Energy-rising partial suppression** (cf. transient processing, Röbel 2003): a broadband hit spikes many bins; partials whose energy jumps sharply over the previous frame are merged onto the few strongest coherent centres, so the whole click is governed by a handful of phase centres = one crisp attack rather than a fan of detuned copies.
 - **Unbroken phase continuity** — no onset reset — so all overlapping grains place a transient at one instant. Stereo uses the same verbatim inter-channel phase copy as the default path, so the image is preserved.
 
-Both paths are opt-in: `--multi` / `Config::Mode::Music`, or `--rhythm` / `Config::Mode::Rhythm`.
+In those real-time tiers, select them explicitly with `--multi` / `Config::Mode::Music`, or `--rhythm` / `Config::Mode::Rhythm`.
 
 ### Multi-resolution time-stretching (offline)
 
 <img src="docs/assets/multires.svg" alt="Multi-resolution: the low band uses a long window for frequency resolution (removes chorusing), the high band uses a short window for time resolution (keeps transients sharp); layout is content-adaptive" width="100%">
 
-The hardest time-stretch material — dense mixes, sustained pads, held vocal vowels — exposes the fundamental limit of a single analysis window. A **short** window keeps transients crisp but lacks the frequency resolution to separate closely-spaced partials, so their phases beat against the overlap-add grid and produce the classic phase-vocoder **"chorusing" / watery** artifact. A **long** window separates the partials cleanly but smears attacks. The optional multi-resolution engine resolves this the way high-end stretchers do — by processing different frequency bands with a window sized for each:
+The hardest time-stretch material — dense mixes, sustained pads, held vocal vowels — exposes the fundamental limit of a single analysis window. A **short** window keeps transients crisp but lacks the frequency resolution to separate closely-spaced partials, so their phases beat against the overlap-add grid and produce the classic phase-vocoder **"chorusing" / watery** artifact. A **long** window separates the partials cleanly but smears attacks. The Offline multi-resolution engine resolves this the way high-end stretchers do — by processing different frequency bands with a window sized for each:
 
 - **Low band, long window** — high frequency resolution keeps dense partials cleanly separated, which is what removes the chorusing/flutter on sustained and complex material.
 - **High band, short window** — high time resolution keeps attacks sharp.
@@ -110,11 +110,11 @@ On top of the band split:
   - **everything else** (tonal mixes, polyphony, speech) → the multi-resolution split.
 - **Ratio-adaptive windows and overlap.** Window length and synthesis overlap adapt to the stretch ratio — a longer window under expansion (tracks slowly-evolving harmonics), higher overlap under compression (keeps the analysis hop fine) — to hold quality across the whole 0.25×–4× range.
 - **Transient pinning.** A *broadband*-onset detector pins the local rate to 1.0 across each attack so it is never time-spread, repaying the timing debt over the following ~100 ms. Gating on a broadband rise (not any spectral flux) keeps it from firing on tonal vibrato, which would otherwise inject amplitude modulation.
-- **Stereo phase lock.** A reference channel drives all phase/onset decisions; the inter-channel phase difference is copied verbatim, preserving the stereo image. Deterministic and bit-identical, like the streaming path.
+- **Stereo phase lock.** The loudest channel drives phase/onset decisions and correlated channels retain their inter-channel phase difference. An extremely quiet, decorrelated tonal bed is rendered independently so broadband energy in another channel cannot modulate it. The result remains deterministic and host-buffer independent.
 
 On pbshift's internal objective chorusing metric (1–25 Hz amplitude-modulation depth on sustained partials, plus attack-sharpness crest on transients), the multi-resolution engine drives the chorusing measure down across the large majority of signal-class × ratio combinations, with the largest reductions at moderate-to-extreme stretch (2×–4×) — exactly where the chorusing artifact is most audible — and holds sustained tonal, voice, and pure-tone material near the noise floor at every ratio. Reproduce with `benchmarks/ratio_eval.py`.
 
-**Status: opt-in offline path.** The streaming default is unchanged; the multi-resolution engine is a whole-signal (buffered) path selected by combining the `Offline` tier with the explicit `PBSHIFT_MULTIRES` switch (see [CLI usage](#cli-usage)). It remains gated pending listening-test confirmation, following the project's convention of validating perceptual changes by ear before promoting them to the default. Formant-preserving requests transparently fall back to the streaming engine.
+**Status: default Offline Music path.** The multi-resolution engine is whole-signal (buffered) and is selected by `Config::Tier::Offline` plus `Config::Mode::Music` (the CLI combination `--tier offline --multi`). `PBSHIFT_MULTIRES` still opts other Offline modes into it for experiments. Live/StudioRT streaming is unchanged, and formant-preserving requests transparently fall back to the streaming engine.
 
 ### Formant preservation
 
@@ -125,6 +125,8 @@ On pbshift's internal objective chorusing metric (1–25 Hz amplitude-modulation
 ### Processing modes and tiers
 
 `Config` exposes a mode hint (`Auto` / `Voice` / `Rhythm` / `Music`) and a latency tier (`Live` / `StudioRT` / `Offline`). `StudioRT` is the reference tier. `Music` uses event-adaptive synthesis windows; `Rhythm` keeps the short window active for percussion. `Voice` applies SHIP-style harmonic locking only in its measured 0.9×–1.6× stretch range and uses the coherence-locked kernel outside that range, avoiding the analysis-hop comb found at 2×. `Live` is the implemented low-latency tier.
+
+For pure time stretch from **0.97× through 1.05×**, Offline Auto/Voice/Music uses the quality-first multi-resolution renderer. Explicit Offline Rhythm uses an endpoint-anchored, absolute-grid WSOLA renderer for broadband and transient material; if any audible channel is sustained/tonal it safely falls back to multi-resolution. Non-trivial clips shorter than 50 ms also use multi-resolution in every mode, avoiding the pitch shift caused by endpoint interpolation. WSOLA analysis positions cannot accumulate timing drift, transients stay on the uniform map, the head and tail are protected, and every audible channel contributes a separately normalized similarity score. Exactly 1.0× is a bit-identical copy, requested output length is exact, and whole-signal output becomes available after `finish()`.
 
 ### Channels, sample rates, buffers
 
@@ -180,7 +182,7 @@ Because input frames consumed by an event are marked as consumed, **transient do
 
 ### Stereo coherence
 
-All phase decisions are made once, on a reference channel; the input's inter-channel phase differences are copied to the output verbatim. Measured stereo coherence drift: **0.000**.
+For correlated stereo/multichannel material, phase decisions are made once on the loudest reference channel and the input inter-channel phase differences are copied to the output. Measured coherence drift on the correlated stereo gate: **0.000**. The only whole-signal exception is an extremely quiet, decorrelated tonal bed underneath a broadband reference; it is rendered independently to prevent the unrelated broadband phase trajectory from modulating that tonal channel.
 
 ### Determinism by construction
 
@@ -232,6 +234,8 @@ public:
 3. `read()` retrieves them;
 4. when the input ends, call `finish()` once — the remaining tail becomes available;
 5. `reset()` returns the instance to a clean state for a new stream.
+
+`Offline` pure time stretch in the 0.97×–1.05× near-unity range is intentionally whole-signal: `available()` remains zero until `finish()`. The API still accepts any `feed()` size. Oversized calls on every path are internally admitted safely and cannot wrap either the input ring or unread WOLA output.
 
 ### Complete example
 
@@ -350,7 +354,7 @@ multires mix.wav mix_2x.wav --stretch 2.0
 multires vowel.wav vowel_slow.wav --stretch 1.5 --voice
 ```
 
-The same experimental engine is reachable through the library by selecting `Config::Tier::Offline` and setting `PBSHIFT_MULTIRES` before `configure()`; `Config::Mode::Voice` selects the voiced layout. Formant-preserving requests fall back to the streaming path. Pitch shifting still runs through the internal resamplers.
+The same engine is the default for `Config::Tier::Offline` + `Config::Mode::Music`. Setting `PBSHIFT_MULTIRES` before `configure()` opts other Offline modes into it; `Config::Mode::Voice` then selects the voiced layout. Formant-preserving requests fall back to the streaming path. Pitch shifting still runs through the internal resamplers.
 
 ## Building
 
@@ -499,7 +503,7 @@ This property is a hard CI gate, not a best-effort behavior — your offline bou
 |---|---|---|
 | `Live` | 2048-point window at 48 kHz; lowest streaming latency | implemented |
 | `StudioRT` | 4096-point window; reference real-time quality | current default |
-| `Offline` | 8192-point streaming window or optional whole-signal multi-resolution path | implemented / experimental |
+| `Offline` | Exact-length WSOLA/MultiRes near unity; Music defaults to whole-signal multi-resolution; other processing uses the 8192-point path | implemented |
 
 - `rt_bench` prints average / worst-case per-block cost against the real-time budget along with the reported latencies for any block size.
 
@@ -525,7 +529,7 @@ third_party/                 vendored dependencies (cloned locally, not tracked)
 
 ## Roadmap
 
-- **Multi-resolution engine → default.** The offline multi-resolution time-stretch engine (above) is implemented and content-adaptive; promoting it from opt-in to the default quality path is gated on listening-test (MUSHRA-style) confirmation.
+- **Broader multi-resolution defaults.** Offline Music now uses the content-adaptive multi-resolution engine by default; expanding that default to more modes remains subject to listening tests.
 - **Streaming multi-resolution.** The multi-resolution path is currently whole-signal (offline). A block-streaming version would bring the chorusing-free quality to real-time inserts.
 - **Per-region content adaptation.** Layout is currently chosen once per signal; per-region (time-varying) detection would let a single track switch layout as it moves between, e.g., a drum fill and a sustained pad.
 - **Voice-specialized engine** — shape-invariant phase processing driven by an F0 tracker, with voiced/unvoiced-aware phase handling, for maximum naturalness on extreme vocal shifts (up to ±24 st).
