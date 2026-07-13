@@ -34,7 +34,10 @@ public:
     // Formant handling (M6).
     void setFormantPreserve(bool enable);
 
-    // Push input samples ([channel][frame], non-interleaved).
+    // Push input samples ([channel][frame], non-interleaved). Any call size is
+    // safe. Offline pure time stretch in [0.97, 1.05], plus Offline Music when
+    // formant preservation is disabled, is whole-signal and becomes readable
+    // after finish(); Live/StudioRT remain streaming.
     void feed(const float* const* in, int frames);
     // Signal end of input; remaining tail becomes available.
     void finish();
