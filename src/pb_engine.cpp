@@ -37,6 +37,7 @@ struct Stretcher::Impl {
     Config cfg;
     int N = 4096;      // FFT / window size
     int hs = 1024;     // synthesis hop (output samples)
+    int baseHs = 1024; // configured hop before deep-compression refinement
     double alpha = 1.0;      // engine (WOLA) stretch = alphaUser * pitchFactor
     double alphaUser = 1.0;  // user-facing time stretch
     double pitchSemi = 0.0;
@@ -86,16 +87,21 @@ struct Stretcher::Impl {
     void updateAlpha() {
         alpha = std::clamp(alphaUser * pitchFactor(), 0.02, 64.0);
         // deep compression: keep the ANALYSIS hop <= N/2 or magnitude
-        // evolution gets temporally aliased (content skipped between frames)
+        // evolution gets temporally aliased (content skipped between frames).
+        // Preserve the finer Music/Rhythm base hop selected by configure();
+        // starting unconditionally at N/4 silently disabled Multi mode whenever
+        // setTimeStretch() or setPitchSemitones() was called (the normal API
+        // sequence), and also expanded its supposedly short synthesis window
+        // back to the full analysis-window length.
         if (synthCount == 0) {
-            int h = N / 4;
+            int h = baseHs;
             while (alpha < 0.5 && h / alpha > N / 2 && h > N / 16) h /= 2;
             hs = h;
         }
-        if (!win.w.empty()) buildShortSyn();   // keep L = 2*hs exact if hs changed
+        if (!win.w.empty()) buildShortSyn();   // refresh short-window geometry
     }
 
-    // Transient short synthesis window (2*hs Hann, centered on N/2) and its
+    // Transient short synthesis window (4*hs Hann, centered on N/2) and its
     // analysis*synthesis product. The dual sig/norm WOLA needs norm += w_ana*w_syn
     // (NOT w_syn^2) to reconstruct exactly through a non-default window.
     void buildShortSyn() {
@@ -175,9 +181,9 @@ struct Stretcher::Impl {
     std::vector<float> jitterAmt;
 
     // Multi mode (Music/Rhythm / PBSHIFT_MULTI): transient-adaptive synthesis
-    // window. Analysis stays full-N (tonal frequency resolution); on transient
-    // frames the output is deposited through a narrow 2*hs Hann so the pinned
-    // attack is time-localized (~2*hs) instead of smeared over the full window.
+    // window. Analysis stays full-N (tonal frequency resolution); output frames
+    // are deposited through a narrow 4*hs Hann so attacks are time-localized
+    // instead of being smeared over the full analysis window.
     std::vector<float> shortSyn, shortProd;  // short synth window + (ana*syn) product
     bool fShortWin = false;                  // per-frame gate (set in stageDecision)
     bool multiMode = false;                  // latched in configure()
@@ -198,7 +204,8 @@ struct Stretcher::Impl {
 
     void configure(const Config& c) {
         cfg = c;
-        // window length by tier (round-trip latency = 1.5 N):
+        // Window length by tier. Auto/Voice round-trip latency is 1.5 N;
+        // Music/Rhythm use the fine hop below and therefore report 1.25 N.
         //   Live      ~2048 @48k -> ~64 ms  (meets the <100 ms insert spec)
         //   StudioRT  ~4096 @48k -> ~128 ms (default, max real-time quality)
         //   Offline   ~8192 @48k -> ~256 ms (best bass resolution)
@@ -210,17 +217,21 @@ struct Stretcher::Impl {
         N = nextPow2(static_cast<int>(cfg.sampleRate * winSec));
         if (const char* f = std::getenv("PBSHIFT_FFT")) N = std::atoi(f);
         // Multi mode (Music/Rhythm / PBSHIFT_MULTI): general-purpose transient-
-        // adaptive vocoder. Long analysis window (freq resolution) + permanent
-        // SHORT synthesis window (dual-window WOLA, Portnoff 1976; Allen & Rabiner
-        // 1977) + fine synthesis hop (high overlap) + spectrum-wide identity-
-        // locked coherent phase on every frame (Laroche & Dolson 1999). Latched
-        // before hs so it selects the finer hop. Auto/Voice keep multiMode=false
-        // -> byte-identical default.
+        // adaptive vocoder. It combines a long analysis window with a fine
+        // synthesis hop and a dual short window. Music enables the short window
+        // only for detected events; Rhythm keeps it active for every frame.
+        // Spectrum-wide identity-locked coherent phase is used throughout
+        // (Laroche & Dolson 1999). Latch the mode before hs so it selects the
+        // finer grid; Auto/Voice retain the standard hop.
         multiMode = (cfg.mode == Config::Mode::Music ||
                      cfg.mode == Config::Mode::Rhythm) ||
                     std::getenv("PBSHIFT_MULTI") != nullptr;
-        hs = multiMode ? N / 8 : N / 4;   // multi: 16x analysis / 4x synth overlap
-        if (const char* h = std::getenv("PBSHIFT_HOPDIV")) hs = N / std::atoi(h);
+        baseHs = multiMode ? N / 8 : N / 4; // multi: fine analysis/synthesis grid
+        if (const char* h = std::getenv("PBSHIFT_HOPDIV")) {
+            const int div = std::clamp(std::atoi(h), 1, N);
+            baseHs = std::max(1, N / div);
+        }
+        hs = baseHs;
         win = WindowSet::hann(N);
         buildShortSyn();
         inCap = 1 << 19;
@@ -295,6 +306,11 @@ struct Stretcher::Impl {
         mrOut.assign(cfg.channels, {});
         mrReadPos = 0;
         mrDone = false;
+        // Re-derive the hop after every configure/reset. This matters when a
+        // ratio was changed during the previous stream: setters intentionally
+        // do not retime an in-flight frame grid, but the next reset stream must
+        // start with the correct mode base hop and deep-compression refinement.
+        updateAlpha();
     }
 
     // ---- pitch-aware streaming wrappers -----------------------------
@@ -791,11 +807,16 @@ struct Stretcher::Impl {
         fe[ch]->analyze(frameBuf.data(), frames[ch]);
         double e = 0.0;
         for (float m : frames[ch].mag) e += static_cast<double>(m) * m;
-        if (e > fBestE) {
-            fBestE = e;
+        // Compare hysteresis-weighted scores, rather than multiplying the
+        // running maximum after the comparison. The old ordering only favoured
+        // reference channel 0; when another channel was the current reference,
+        // an only-slightly louder earlier channel could steal the phase anchor
+        // every frame and destabilize the stereo image.
+        const double score = (ch == refCh) ? 1.5 * e : e;
+        if (score > fBestE) {
+            fBestE = score;
             fBest = ch;
         }
-        if (ch == refCh) fBestE *= 1.5;  // hysteresis: favour current ref
         if (ch == cfg.channels - 1) refCh = fBest;
     }
 
@@ -919,37 +940,37 @@ struct Stretcher::Impl {
 
         fCOut = synthCount * hs;
         const bool transientActive = onset || pendCount > 0 || pinRemain > 0;
-        // Multi mode: deposit EVERY frame through the short synthesis window (the
-        // classic long-analysis/short-synthesis dual-window split -- discards the
-        // iFFT skirts that spread a phase-modified transient into pre/post echo).
-        // Frame-global via refCh so both stereo channels switch together and the
-        // verbatim inter-channel phase copy holds.
-        fShortWin = multiMode;
+        // Music mode keeps the full synthesis window on steady tonal frames
+        // (best harmonic purity and stereo stability), then switches the whole
+        // channel set to the short dual window on detected event frames. Rhythm
+        // mode intentionally stays short at all times: it trades a little tonal
+        // efficiency for the sharpest possible dense percussion.
+        const bool rhythmShort = cfg.mode == Config::Mode::Rhythm;
+        fShortWin = multiMode && (rhythmShort || transientActive);
         pushMagHistory(frames[refCh]);
         if (!noJitter && !transientActive)
             computeJitter(frames[refCh], alpha);
         else
             std::fill(jitterAmt.begin(), jitterAmt.end(), 0.0f);
-        // Voice mode: shape-invariant harmonic-locked phase on voiced frames
-        // (transient frames still take the synchronized reset via stepLocked).
-        // Widened to alphaUser in [0.9, 2.5] to cover 2x time-stretch: the hop-
-        // synchronous comb ("fine DelayEcho") that identity-lock leaves on
-        // stretched voice is exactly what harmonic locking removes. Non-voiced
-        // frames within Voice mode take the coherence-locked kernel (not plain
-        // stepLocked) so the whole utterance stays comb-free. Only fires in
-        // explicit Voice mode / PBSHIFT_VOICE, so the Auto default is unaffected.
-        const bool voiceMode =
-            (cfg.mode == Config::Mode::Voice || forceVoice) && !onset &&
-            alphaUser >= 0.9 && alphaUser <= 2.5;
+        // Voice mode: shape-invariant harmonic locking is beneficial only in
+        // its measured range. Extending it to 2x time stretch produced a strong
+        // analysis-hop comb on real speech, so outside [0.9, 1.6] Voice stays on
+        // the coherence-locked kernel instead of silently falling all the way
+        // back to plain identity locking. Pitch-shift cases (alphaUser == 1)
+        // retain the SHIP-style low-harmonic phase relationship.
+        const bool voiceRequested =
+            cfg.mode == Config::Mode::Voice || forceVoice;
+        const bool voiceShip = voiceRequested && !onset &&
+                               alphaUser >= 0.9 && alphaUser <= 1.6;
         double f0Bin = -1.0;
-        if (voiceMode) f0Bin = estimateF0Bin(frames[refCh]);
-        if (voiceMode && f0Bin > 0.0) {
+        if (voiceShip) f0Bin = estimateF0Bin(frames[refCh]);
+        if (voiceShip && f0Bin > 0.0) {
             pghi->stepVoice(frames[refCh], hs, f0Bin, synthPhase);
         } else if (usePghi) {
             pghi->step(frames[refCh], hs, localAlpha,
                        static_cast<uint64_t>(synthCount),
                        onset ? resetMask.data() : nullptr, synthPhase);
-        } else if (forceCoherent || voiceMode || multiMode) {
+        } else if (forceCoherent || voiceRequested || multiMode) {
             // coherence-locked identity kernel: explicit opt-in (PBSHIFT_COHERENT
             // on any mode), Multi mode, or the non-voiced fallback inside Voice.
             // Multi/coherent tonal frames stay comb-free (stepLockedCoherent);
