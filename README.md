@@ -1,12 +1,14 @@
 # pbPitchShift (`pbshift`)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 <img src="docs/assets/banner.svg" alt="pbshift — real-time pitch-shift and time-stretch, no trade-offs" width="100%">
 
 **[日本語 README はこちら / Japanese README → README.ja.md](README.ja.md)**
 
 A real-time **pitch-shifting / time-stretching C++ library**, engineered so that harmonic purity, transient sharpness, natural formants, and bit-exact reproducibility all hold at once — none traded off against the others.
 
-- **C++17 static library**, zero external runtime dependencies (one bundled BSD-like FFT)
+- **C++17 static library**, zero external runtime dependencies (pffft is used at build time under a BSD-like license)
 - **Streaming pull API** (`feed` → `available` → `read`, `finish` to flush) for real-time inserts and offline rendering alike
 - **Pitch ±24 semitones**, **time-stretch 0.25×–4×** (wider values are accepted and clamped internally), independent and combinable
 - **Formant preservation** via a True Envelope class spectral-envelope engine
@@ -537,10 +539,9 @@ third_party/                 vendored dependencies (cloned locally, not tracked)
 - **Real-time load smoothing** — split-computation scheduling to flatten worst-case per-block cost during pitch shifting.
 - **`Live` latency tier** — asymmetric analysis/synthesis window pair for sub-60 ms operation.
 - **VST3 wrapper** — a reference real-time insert plugin on top of the streaming API.
-- **License finalization** — see below.
 
 ## License and credits
 
-- **License: TBD.** The intended license is **MIT**; a `LICENSE` file will be added before the first tagged release. Until then, all rights reserved.
-- **Bundled third-party code:** [pffft](https://github.com/marton78/pffft) (BSD-like FFTPACK-derived license) is the engine's only shipped dependency, used for FFTs. This repository ships only pbshift and pffft — no other audio-processing engine is bundled, linked, or distributed with it.
+- **License:** pbshift is open-source software released under the [MIT License](LICENSE).
+- **Third-party dependency:** [pffft](https://github.com/marton78/pffft) (BSD-like FFTPACK-derived license) is used for FFTs. It retains its own copyright and license; see [Third-party notices](THIRD_PARTY_NOTICES.md). No other audio-processing engine is bundled, linked, or distributed with pbshift.
 - The engine is a cleanroom implementation built from published research and our own measurements.
