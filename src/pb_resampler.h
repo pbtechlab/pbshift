@@ -46,6 +46,9 @@ public:
         pos_ = 0.0;
         outCount_ = 0;
         baseIn_ = 0;
+        segRatio_ = 0.0;
+        srcBase_ = 0.0;
+        outBase_ = 0;
         buf_.assign(ch_, {});
     }
 
@@ -66,9 +69,15 @@ public:
     // Produce up to maxOut frames at the given ratio; returns count.
     // out: [channel][frames].
     // Deterministic and chunk-independent: the source position of output j
-    // is computed from absolute integer counters (outCount_/ratio), never
-    // from an accumulated float, so call-boundary placement cannot change
-    // a single output bit. Ratio must stay constant within a stream.
+    // is computed from integer counters measured against the start of the
+    // current ratio segment (srcBase_ + (outCount_ - outBase_)/ratio), never
+    // from a per-sample accumulated float, so call-boundary placement cannot
+    // change a single output bit.
+    // The ratio MAY change between calls (pitch automation): the segment base
+    // is re-anchored at the current source position, so the read position
+    // stays continuous and monotonic across the change. With a constant ratio
+    // the bases stay 0 and the expression reduces to outCount_/ratio, i.e.
+    // output is bit-identical to the fixed-ratio-only implementation.
     int process(float* const* out, int maxOut, double ratio) {
         if (buf_.empty() || buf_[0].empty()) return 0;
         const double cutoff = 0.92 * std::min(1.0, ratio);
@@ -79,11 +88,17 @@ public:
             memoW_.clear();
             memoSkip_.clear();
         }
+        if (!(ratio == segRatio_)) {  // re-anchor: keep the read position put
+            if (segRatio_ > 0.0 && outCount_ > outBase_)
+                srcBase_ += static_cast<double>(outCount_ - outBase_) / segRatio_;
+            outBase_ = outCount_;
+            segRatio_ = ratio;
+        }
         const long long avail =
             baseIn_ + static_cast<long long>(buf_[0].size());
         int made = 0;
         while (made < maxOut) {
-            const double srcAbs = static_cast<double>(outCount_) / ratio;
+            const double srcAbs = srcPosOf(outCount_, ratio);
             const long long i0 = static_cast<long long>(std::floor(srcAbs));
             if (i0 + taps_ >= avail) break;  // need more input
             // srcAbs - i0 is exact (both representable, result in [0,1)),
@@ -138,14 +153,23 @@ public:
             ++made;
         }
         // drop consumed history (keep taps_ of lookbehind)
-        const long long nextI0 = static_cast<long long>(
-            std::floor(static_cast<double>(outCount_) / ratio));
+        const long long nextI0 =
+            static_cast<long long>(std::floor(srcPosOf(outCount_, ratio)));
         const long long keepFrom = nextI0 - taps_;
         if (keepFrom > baseIn_) {
-            const long long drop = keepFrom - baseIn_;
-            for (int c = 0; c < ch_; ++c)
-                buf_[c].erase(buf_[c].begin(), buf_[c].begin() + drop);
-            baseIn_ = keepFrom;
+            // Never drop more than is buffered. The read position can jump
+            // ahead of the buffered range (a ratio change makes the source
+            // advance faster than the input arrives), and an unclamped erase
+            // would run past end() — an out-of-bounds write, not a no-op.
+            long long drop = keepFrom - baseIn_;
+            const long long have = static_cast<long long>(buf_[0].size());
+            if (drop > have) drop = have;
+            if (drop > 0) {
+                for (int c = 0; c < ch_; ++c)
+                    buf_[c].erase(buf_[c].begin(),
+                                  buf_[c].begin() + static_cast<size_t>(drop));
+                baseIn_ += drop;
+            }
         }
         return made;
     }
@@ -155,6 +179,12 @@ public:
     }
 
 private:
+    // Absolute source position of output frame n under the current ratio
+    // segment. With a constant ratio this is exactly n/ratio.
+    double srcPosOf(long long n, double ratio) const {
+        return srcBase_ + static_cast<double>(n - outBase_) / ratio;
+    }
+
     // ---- per-phase tap-weight memo (bit-identical fast path) ----------
     // The sinc and Kaiser weights depend only on the fractional source
     // phase frac = srcAbs - i0 (and the fixed ratio). For dyadic ratios
@@ -235,6 +265,11 @@ private:
     double pos_;
     long long outCount_ = 0;  // absolute output frames produced
     long long baseIn_ = 0;    // absolute input index of buf_[0]
+    // Current ratio segment (see process()). Re-anchored whenever the ratio
+    // changes so the source position stays continuous across pitch automation.
+    double segRatio_ = 0.0;   // 0 = no segment started yet
+    double srcBase_ = 0.0;    // source position at the start of the segment
+    long long outBase_ = 0;   // outCount_ at the start of the segment
     std::vector<std::vector<float>> buf_;
 };
 

@@ -856,6 +856,84 @@ int main() {
                 ratioDiffs);
     if (!ratioChangePass) ++fails;
 
+    // Pitch automation while streaming: a host that ramps the pitch between
+    // feeds (pitch envelopes / clip pitch curves) must keep producing output
+    // and must not walk the resampler read position past its input queue.
+    // Before the segment re-anchoring in SincResampler this overran the
+    // buffered input and erased past end().
+    {
+        Config cfg;
+        cfg.sampleRate = 48000;
+        cfg.channels = 1;
+        cfg.tier = Config::Tier::StudioRT;
+        const int n = 48000;
+        std::vector<float> x(n);
+        for (int i = 0; i < n; ++i)
+            x[i] = static_cast<float>(
+                0.6 * std::sin(2.0 * kPi * 440.0 * i / cfg.sampleRate));
+
+        auto rampRender = [&](int step, bool up) {
+            Stretcher st;
+            st.configure(cfg);
+            st.setTimeStretch(1.0);
+            st.setFormantPreserve(false);
+            std::vector<float> out;
+            std::vector<float> scratch(8192);
+            float* op[] = {scratch.data()};
+            auto drain = [&]() {
+                while (st.available() > 0) {
+                    const int want = std::min(8192, st.available());
+                    const int made = st.read(op, want);
+                    if (made <= 0) break;
+                    out.insert(out.end(), scratch.begin(), scratch.begin() + made);
+                }
+            };
+            int fed = 0;
+            while (fed < n) {
+                const int k = std::min(step, n - fed);
+                const double t = static_cast<double>(fed) / n;
+                st.setPitchSemitones(up ? 12.0 * t : -12.0 * t);
+                const float* ip[] = {x.data() + fed};
+                st.feed(ip, k);
+                fed += k;
+                drain();
+            }
+            st.finish();
+            drain();
+            return out;
+        };
+
+        // Both ramp directions, and both a fine and a coarse update rate.
+        const std::vector<float> upFine = rampRender(256, true);
+        const std::vector<float> upCoarse = rampRender(4096, true);
+        const std::vector<float> down = rampRender(256, false);
+        // Output length tracks the (unchanged) time ratio; allow the engine's
+        // latency tail but require most of the signal to come out.
+        const bool lengthsOk = upFine.size() >= static_cast<size_t>(n * 9 / 10) &&
+                               upCoarse.size() >= static_cast<size_t>(n * 9 / 10) &&
+                               down.size() >= static_cast<size_t>(n * 9 / 10);
+        // The ramp must actually move the pitch, monotonically, in the
+        // requested direction: compare the first and last fifth.
+        auto bandHz = [&](const std::vector<float>& y, double a, double b) {
+            const size_t i0 = static_cast<size_t>(y.size() * a);
+            const size_t i1 = static_cast<size_t>(y.size() * b);
+            if (i1 <= i0 + 2) return 0.0;
+            std::vector<float> part(y.begin() + i0, y.begin() + i1);
+            return risingCrossingHz(part, cfg.sampleRate, 0.0, 1.0);
+        };
+        const double upHead = bandHz(upFine, 0.05, 0.25);
+        const double upTail = bandHz(upFine, 0.70, 0.90);
+        const double dnHead = bandHz(down, 0.05, 0.25);
+        const double dnTail = bandHz(down, 0.70, 0.90);
+        const bool rampOk = upTail > upHead * 1.3 && dnTail < dnHead * 0.8;
+        const bool automationPass = lengthsOk && rampOk;
+        std::printf("%s pitch automation while streaming n=%zu up %.0f->%.0f Hz "
+                    "down %.0f->%.0f Hz\n",
+                    automationPass ? "PASS" : "FAIL", upFine.size(), upHead,
+                    upTail, dnHead, dnTail);
+        if (!automationPass) ++fails;
+    }
+
     std::printf(fails ? "\n%d FAILURES\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }
