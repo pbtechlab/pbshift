@@ -49,6 +49,7 @@ public:
         segRatio_ = 0.0;
         srcBase_ = 0.0;
         outBase_ = 0;
+        inputFed_ = 0;
         buf_.assign(ch_, {});
     }
 
@@ -57,6 +58,7 @@ public:
         if (buf_.size() != static_cast<size_t>(ch_)) buf_.resize(ch_);
         for (int c = 0; c < ch_; ++c)
             buf_[c].insert(buf_[c].end(), in[c], in[c] + frames);
+        inputFed_ += frames;
     }
 
     void finish() {
@@ -178,6 +180,27 @@ public:
         return buf_.empty() ? 0 : static_cast<int>(buf_[0].size());
     }
 
+    // Absolute count of input frames fed so far, and the input position the
+    // next output frame will read from. A caller that must switch the ratio at
+    // a specific INPUT position (pitch automation: the ratio change has to
+    // land on the same audio the engine's stretch change landed on) uses these
+    // to stop `process()` right before that position.
+    long long inputFed() const { return inputFed_; }
+    double nextSourcePos(double ratio) const { return srcPosOf(outCount_, ratio); }
+    // How many output frames can be produced before the read position would
+    // reach input position `inputLimit` (absolute, in fed frames).
+    int outputsBefore(double ratio, long long inputLimit) const {
+        const double from = srcPosOf(outCount_, ratio);
+        // Keep the sinc window fully inside the allowed range: an output frame
+        // at source position p reads up to p + taps.
+        const double head = static_cast<double>(inputLimit) - static_cast<double>(taps_);
+        if (head <= from) return 0;
+        const double n = (head - from) * ratio;
+        if (n <= 0.0) return 0;
+        if (n > 2147483647.0) return 2147483647;
+        return static_cast<int>(n);
+    }
+
 private:
     // Absolute source position of output frame n under the current ratio
     // segment. With a constant ratio this is exactly n/ratio.
@@ -270,6 +293,7 @@ private:
     double segRatio_ = 0.0;   // 0 = no segment started yet
     double srcBase_ = 0.0;    // source position at the start of the segment
     long long outBase_ = 0;   // outCount_ at the start of the segment
+    long long inputFed_ = 0;  // absolute input frames handed to feed()
     std::vector<std::vector<float>> buf_;
 };
 

@@ -934,6 +934,90 @@ int main() {
         if (!automationPass) ++fails;
     }
 
+    // Timing under pitch automation: the engine stretch (alpha) changes on the
+    // input side while the output resampler ratio changes on the output side,
+    // and the two are separated by the engine's latency. Applying both at the
+    // call site put the new output ratio on audio stretched with the old
+    // alpha, and the mismatch accumulated: over 3.5 s of a 0 -> +12 st ramp,
+    // marker positions walked off by ~1300 samples and kept going.
+    // Markers must stay put (a pitch ramp is not a time ramp).
+    {
+        Config cfg;
+        cfg.sampleRate = 48000;
+        cfg.channels = 1;
+        cfg.tier = Config::Tier::StudioRT;
+        const int sr = cfg.sampleRate;
+        const int n = sr * 4, step = sr / 2, burst = 480;
+        std::vector<float> x(n, 0.0f);
+        for (int k = 0; k * step + burst < n; ++k)
+            for (int i = 0; i < burst; ++i) {
+                const double env = 0.5 - 0.5 * std::cos(2.0 * kPi * i / burst);
+                x[k * step + i] = static_cast<float>(
+                    0.8 * env * std::sin(2.0 * kPi * 1000.0 * i / sr));
+            }
+
+        auto rampPositions = [&](double from, double to) {
+            Stretcher st;
+            st.configure(cfg);
+            st.setTimeStretch(1.0);
+            st.setFormantPreserve(false);
+            st.setPitchSemitones(from);
+            std::vector<float> y;
+            std::vector<float> scratch(8192);
+            float* op[] = {scratch.data()};
+            auto drain = [&]() {
+                while (st.available() > 0) {
+                    const int want = std::min(8192, st.available());
+                    const int got = st.read(op, want);
+                    if (got <= 0) break;
+                    y.insert(y.end(), scratch.begin(), scratch.begin() + got);
+                }
+            };
+            for (int fed = 0; fed < n; ) {
+                const int k = std::min(256, n - fed);
+                st.setPitchSemitones(from + (to - from) * fed / n);
+                const float* ip[] = {x.data() + fed};
+                st.feed(ip, k);
+                fed += k;
+                drain();
+            }
+            st.finish();
+            drain();
+            // Energy centroid of each burst, relative to where it went in.
+            std::vector<int> off;
+            for (int k = 0; k * step + burst < n; ++k) {
+                const int at = k * step;
+                const int lo = std::max(0, at - step / 2);
+                const int hi = std::min<int>(static_cast<int>(y.size()), at + step / 2);
+                double num = 0.0, den = 0.0;
+                for (int i = lo; i < hi; ++i) {
+                    const double e = static_cast<double>(y[i]) * y[i];
+                    num += e * i;
+                    den += e;
+                }
+                if (den <= 1e-9) continue;
+                off.push_back(static_cast<int>(num / den) - (at + burst / 2));
+            }
+            return off;
+        };
+
+        int worst = 0;
+        for (const auto& ramp : {std::pair<double, double>{0.0, 12.0},
+                                 std::pair<double, double>{0.0, -12.0},
+                                 std::pair<double, double>{-6.0, 6.0}}) {
+            const std::vector<int> off = rampPositions(ramp.first, ramp.second);
+            if (off.size() < 4) { worst = 1 << 20; break; }
+            for (int v : off) worst = std::max(worst, std::abs(v));
+        }
+        // One synthesis hop (1024) of positional wander is inherent to the
+        // phase vocoder; a broken schedule was several times that and growing.
+        const bool driftPass = worst <= 1400;
+        std::printf("%s pitch automation keeps markers in time worst=%d samples "
+                    "(%.1f ms)\n",
+                    driftPass ? "PASS" : "FAIL", worst, 1000.0 * worst / 48000.0);
+        if (!driftPass) ++fails;
+    }
+
     std::printf(fails ? "\n%d FAILURES\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <complex>
 #include <cstring>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -51,6 +52,23 @@ struct Stretcher::Impl {
     std::vector<std::vector<float>> resBuf;
     std::vector<float*> resPtr;
     std::vector<const float*> cPtr;
+
+    // ---- output-side ratio scheduling (pitch automation) -----------------
+    // alpha (the engine stretch) changes on the INPUT side: it applies to the
+    // frames analysed from here on. postRatio() changes on the OUTPUT side.
+    // Applying both the moment setPitchSemitones() is called puts the new
+    // output ratio on audio that was stretched with the OLD alpha -- the two
+    // are separated by the engine's latency -- and the mismatch accumulates
+    // into a growing timing error. So the output ratio is queued and applied
+    // where that audio actually reaches the output resampler.
+    struct PostChange {
+        long long atInput;  // resOut input position (frames fed to resOut)
+        double ratio;
+    };
+    std::deque<PostChange> pendingPost;
+    bool postActive = false;   // output resampler in the signal path
+    double curPost = 1.0;      // ratio currently applied by resOut
+    long long postBase = 0;    // engine output position where resOut started
 
     // ---- offline multi-resolution path ---------------------------------
     // Offline Music selects this whole-input path by default;
@@ -299,6 +317,10 @@ struct Stretcher::Impl {
         inPos = 0.0;
         readPos = 0;
         refCh = 0;
+        pendingPost.clear();
+        postActive = postRatio() != 1.0;
+        curPost = postRatio();
+        postBase = 0;
         prevRefMag.clear();
         prevMagCh.assign(cfg.channels, {});
         resetMask.assign(N / 2 + 1, 0);
@@ -399,10 +421,51 @@ struct Stretcher::Impl {
         }
         finished = true;
         pump();
-        if (postRatio() != 1.0) {
+        if (postActive) {
             drainEngineToResOut();
             resOut->finish();
         }
+    }
+
+    // Queue the new output ratio at the output position where the audio that
+    // the new alpha applies to will appear. The next frame synthesised with
+    // the new alpha lands at synthCount * hs, so that is the switch point.
+    // Called after every pitch change; a no-op while the stream stays at a
+    // single pitch (the ratio never changes, nothing is queued).
+    void schedulePostChange() {
+        const double np = postRatio();
+        // Settings made before the stream starts are not automation: apply
+        // them straight away, exactly as before, so the initial latency and
+        // the priming an insert host does stay unchanged.
+        if (totalIn == 0 && synthCount == 0) {
+            pendingPost.clear();
+            postActive = np != 1.0;
+            curPost = np;
+            postBase = 0;
+            engineHanded = 0;
+            return;
+        }
+        if (!postActive) {
+            if (np == 1.0) { curPost = 1.0; return; }  // resOut still not needed
+            // Entering the resampled path mid-stream: everything up to readPos
+            // was read straight from the WOLA accumulators, so resOut starts
+            // from there, at unity, and switches to np at the queued point.
+            postActive = true;
+            postBase = readPos;
+            engineHanded = readPos;
+            curPost = 1.0;
+            resOut->reset();
+        }
+        // The next frame synthesised under the new alpha lands at
+        // synthCount * hs, so that is where its audio starts appearing.
+        // (Measured: pushing the switch later -- by half a window, or by
+        // carrying the not-yet-analysed input through the stretch -- moves the
+        // click positions the wrong way in both ramp directions.)
+        const long long at = std::max(0LL, synthCount * hs - postBase);
+        if (!pendingPost.empty() && pendingPost.back().atInput >= at)
+            pendingPost.back().ratio = np;  // same point: keep one entry
+        else
+            pendingPost.push_back({at, np});
     }
 
     // engine output finalized frames not yet handed to resOut
@@ -434,11 +497,11 @@ struct Stretcher::Impl {
             return (int)std::min<long long>(
                 1 << 30, (long long)mrOut[0].size() - mrReadPos);
         }
-        if (postRatio() != 1.0) {
+        if (postActive) {
             drainEngineToResOut();
             const int taps = 72;
             return std::max(0, static_cast<int>(
-                                   (resOut->pending() - taps) * postRatio()));
+                                   (resOut->pending() - taps) * curPost));
         }
         long long f = finalized();
         if (finished) f = synthCount * hs + N / 2;
@@ -466,9 +529,31 @@ struct Stretcher::Impl {
             mrReadPos += n;
             return n;
         }
-        if (postRatio() != 1.0) {
+        if (postActive) {
             drainEngineToResOut();
-            return resOut->process(out, nf, postRatio());
+            // Produce in pieces so a queued ratio change lands exactly on the
+            // audio it belongs to, instead of retroactively on what is already
+            // in the resampler's queue.
+            std::vector<float*> op(cfg.channels);
+            int total = 0;
+            while (total < nf) {
+                int limit = nf - total;
+                if (!pendingPost.empty()) {
+                    const int room =
+                        resOut->outputsBefore(curPost, pendingPost.front().atInput);
+                    if (room <= 0) {
+                        curPost = pendingPost.front().ratio;
+                        pendingPost.pop_front();
+                        continue;
+                    }
+                    limit = std::min(limit, room);
+                }
+                for (int ch = 0; ch < cfg.channels; ++ch) op[ch] = out[ch] + total;
+                const int n = resOut->process(op.data(), limit, curPost);
+                if (n <= 0) break;
+                total += n;
+            }
+            return total;
         }
         const int n = std::min(nf, availableUser());
         for (int ch = 0; ch < cfg.channels; ++ch)
@@ -621,8 +706,7 @@ struct Stretcher::Impl {
         // bounded pieces so pump() can consume it before wraparound, while the
         // WOLA accumulators are grown once, ahead of synthesis, to retain all
         // unread output.  External call boundaries still do not affect bits.
-        const long long preserveFrom =
-            postRatio() != 1.0 ? engineHanded : readPos;
+        const long long preserveFrom = postActive ? engineHanded : readPos;
         long long currentOutputEnd = 0;
         for (const auto& ws : wola)
             currentOutputEnd = std::max(currentOutputEnd, ws->highWater());
@@ -1634,9 +1718,13 @@ void Stretcher::setTimeStretch(double ratio) {
 }
 void Stretcher::setPitchSemitones(double s) {
     const double value = std::clamp(s, -24.0, 24.0);
-    if (value != impl_->pitchSemi) impl_->fallbackNearToStreaming();
+    if (value == impl_->pitchSemi) return;
+    impl_->fallbackNearToStreaming();
     impl_->pitchSemi = value;
     impl_->updateAlpha();
+    // The stretch change above takes effect on the input side; queue the
+    // matching output-side ratio so both land on the same audio.
+    impl_->schedulePostChange();
 }
 void Stretcher::setFormantPreserve(bool e) {
     if (e != impl_->formant) impl_->fallbackNearToStreaming();

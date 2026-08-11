@@ -11,7 +11,7 @@ A real-time **pitch-shifting / time-stretching C++ library**, engineered so that
 - **C++17 static library**, zero external runtime dependencies (pffft is used at build time under a BSD-like license)
 - **Streaming pull API** (`feed` → `available` → `read`, `finish` to flush) for real-time inserts and offline rendering alike
 - **Pitch ±24 semitones**, **time-stretch 0.25×–4×** (wider values are accepted and clamped internally), independent and combinable
-- **Automatable while streaming**: `setPitchSemitones()` / `setTimeStretch()` may be called between `feed()` calls, so a host can follow a pitch envelope without splitting the signal into segments — the read position is re-anchored at the change, so it stays continuous and monotonic
+- **Automatable while streaming**: `setPitchSemitones()` / `setTimeStretch()` may be called between `feed()` calls, so a host can follow a pitch envelope without splitting the signal into segments — the read position is re-anchored at the change, and the output-side ratio is applied where that audio actually reaches the output, so a pitch ramp does not drag the material out of time
 - **Formant preservation** via a True Envelope class spectral-envelope engine
 - **Multi-resolution time-stretch engine** (offline) — band-dependent window sizing with content-adaptive layout, which removes the phase-vocoder "chorusing"/watery artifact on dense mixes, pads, and held vowels while keeping transients sharp
 - **Deterministic**: same input + same settings ⇒ **bit-identical output**, regardless of host buffer size, and across re-renders
