@@ -21,6 +21,7 @@
 #include "pb_envelope.h"
 #include "pb_fft.h"
 #include "pb_multires.h"
+#include "pb_voice.h"
 #include "pb_pghi.h"
 #include "pb_resampler.h"
 #include "pb_stft.h"
@@ -88,6 +89,13 @@ struct Stretcher::Impl {
     // requested, fall back to the streaming engine (which has it). Evaluated
     // lazily because setFormantPreserve() is called after configure().
     bool mrActive() const { return useMultiRes && !formant; }
+
+    // Pitch-synchronous voice engine. Streaming and causal, so unlike the
+    // multi-resolution path it does not have to buffer the whole signal; it is
+    // opt-in per mode and never touches any other mode's output.
+    VoiceStretch voice;
+    bool useVoice = false;
+    bool vsActive() const { return useVoice && !formant && !nearBuffered; }
 
     // ---- content-adaptive near-unity offline path ----------------------
     // A single-resolution phase vocoder needlessly reconstructs every sample
@@ -255,6 +263,11 @@ struct Stretcher::Impl {
         // Offline Music is the public "Multi" quality path: select the true
         // multi-resolution renderer by default.  The environment switch still
         // opts other modes into it for experiments/backward compatibility.
+        useVoice = cfg.mode == Config::Mode::Voice;
+        if (useVoice) {
+            voice.configure(cfg.sampleRate, cfg.channels);
+            voice.setStretch(alpha);
+        }
         useMultiRes = cfg.tier == Config::Tier::Offline &&
                       (cfg.mode == Config::Mode::Music ||
                        std::getenv("PBSHIFT_MULTIRES") != nullptr);
@@ -307,6 +320,7 @@ struct Stretcher::Impl {
     }
 
     void resetState() {
+        if (useVoice) voice.reset();
         for (auto& r : inRing) std::fill(r.begin(), r.end(), 0.0f);
         for (auto& w : wola) w->clear();
         pghi->reset();
@@ -415,6 +429,15 @@ struct Stretcher::Impl {
                 runNearUnity();
             return;
         }
+        if (vsActive()) {
+            voice.finish();
+            if (postActive) {
+                drainVoiceToResOut();
+                resOut->finish();
+            }
+            finished = true;
+            return;
+        }
         if (mrActive()) {
             runMultiRes();
             return;
@@ -470,6 +493,16 @@ struct Stretcher::Impl {
 
     // engine output finalized frames not yet handed to resOut
     long long engineHanded = 0;
+    void drainVoiceToResOut() {
+        for (;;) {
+            const int room = static_cast<int>(resBuf[0].size());
+            const int n = voice.read(resPtr.data(), room);
+            if (n <= 0) return;
+            for (int c = 0; c < cfg.channels; ++c) cPtr[c] = resPtr[c];
+            resOut->feed(const_cast<const float* const*>(cPtr.data()), n);
+        }
+    }
+
     void drainEngineToResOut() {
         while (true) {
             long long fin = finalized();
@@ -492,13 +525,15 @@ struct Stretcher::Impl {
             return (int)std::min<long long>(
                 1 << 30, (long long)nearOut[0].size() - nearReadPos);
         }
+        if (vsActive() && !postActive) return voice.available();
         if (mrActive()) {
             if (!mrDone) return 0;
             return (int)std::min<long long>(
                 1 << 30, (long long)mrOut[0].size() - mrReadPos);
         }
         if (postActive) {
-            drainEngineToResOut();
+            if (vsActive()) drainVoiceToResOut();
+            else drainEngineToResOut();
             const int taps = 72;
             return std::max(0, static_cast<int>(
                                    (resOut->pending() - taps) * curPost));
@@ -529,8 +564,10 @@ struct Stretcher::Impl {
             mrReadPos += n;
             return n;
         }
+        if (vsActive() && !postActive) return voice.read(out, nf);
         if (postActive) {
-            drainEngineToResOut();
+            if (vsActive()) drainVoiceToResOut();
+            else drainEngineToResOut();
             // Produce in pieces so a queued ratio change lands exactly on the
             // audio it belongs to, instead of retroactively on what is already
             // in the resampler's queue.
@@ -691,6 +728,13 @@ struct Stretcher::Impl {
             for (int ch = 0; ch < cfg.channels; ++ch)
                 nearIn[ch].insert(nearIn[ch].end(), in[ch], in[ch] + nf);
             totalIn += nf;
+            return;
+        }
+        if (vsActive()) {
+            voice.setStretch(alpha);
+            voice.feed(in, nf);
+            totalIn += nf;
+            if (postActive) drainVoiceToResOut();
             return;
         }
         if (mrActive()) {
@@ -1745,10 +1789,16 @@ int Stretcher::read(float* const* out, int frames) {
     return impl_->readUser(out, frames);
 }
 
-int Stretcher::inputLatency() const { return impl_->N / 2; }
+int Stretcher::inputLatency() const {
+    if (impl_->vsActive()) return impl_->voice.inputLatency();
+    return impl_->N / 2;
+}
 // + one extra hop: the staged frame pipeline finishes a frame up to one
 // nominal frame period after its input span completes (output content is
 // unchanged; only availability shifts by at most hs output samples).
-int Stretcher::outputLatency() const { return impl_->N / 2 + 2 * impl_->hs; }
+int Stretcher::outputLatency() const {
+    if (impl_->vsActive()) return impl_->voice.outputLatency();
+    return impl_->N / 2 + 2 * impl_->hs;
+}
 
 }  // namespace pbshift

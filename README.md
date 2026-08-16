@@ -130,11 +130,23 @@ On pbshift's internal objective chorusing metric (1–25 Hz amplitude-modulation
 | Mode | Material it is for | CLI | Current state |
 |---|---|---|---|
 | `Auto` | unknown / mixed input | *(default)* | picks a layout from spectral flatness and pitch periodicity |
-| `Voice` | speech, vocals | `--voice` | harmonic-locked in its measured range; the pitch-synchronous prototype in `benchmarks/` is ahead of it and not yet ported (see [Roadmap](#roadmap)) |
+| `Voice` | speech, vocals | `--voice` | pitch-synchronous time-domain engine (`src/pb_voice.h`): real pitch-period grains, streaming and causal, ~46 ms input latency at 48 kHz |
 | `Music` | mixes, polyphony | `--multi` | event-adaptive synthesis windows; the mix-oriented default |
 | `Rhythm` | drums, percussion | `--rhythm` | continuously short synthesis window; the sharpest attacks we render |
 
-`Config` exposes a mode hint (`Auto` / `Voice` / `Rhythm` / `Music`) and a latency tier (`Live` / `StudioRT` / `Offline`). `StudioRT` is the reference tier. `Music` uses event-adaptive synthesis windows; `Rhythm` keeps the short window active for percussion. `Voice` applies SHIP-style harmonic locking only in its measured 0.9×–1.6× stretch range and uses the coherence-locked kernel outside that range, avoiding the analysis-hop comb found at 2×. `Live` is the implemented low-latency tier.
+`Config` exposes a mode hint (`Auto` / `Voice` / `Rhythm` / `Music`) and a latency tier (`Live` / `StudioRT` / `Offline`). `StudioRT` is the reference tier. `Music` uses event-adaptive synthesis windows; `Rhythm` keeps the short window active for percussion. `Live` is the implemented low-latency tier.
+
+### Voice: pitch-synchronous, and why it is time domain
+
+`Voice` does not run through the spectral engine at all. A phase vocoder buys length by re-printing spectral frames, and on speech that reads as a fine "delay echo" — copies of the same glottal pulse landing one synthesis hop apart. `src/pb_voice.h` carries **real pitch periods** instead, so the waveform is never resynthesised: that comb has no way to form, and the spectral valleys between harmonics stay as clean as the input's.
+
+Three mechanisms, each aimed at one audible defect:
+
+- **Consistent-polarity pitch marks.** Every mark is refined to the local extremum of one globally chosen excitation polarity. Marks that flip sign between periods splice opposite-going waveforms and click.
+- **Wide correlation search on the low band (±0.9 period).** When a period must be reused to buy time, a narrow search leaves the copy sitting almost exactly one period from its original — the deepest possible comb, heard as doubling. A wide search lets the reuse land where the waveform actually matches, which costs neither chorus (nothing is blended) nor noise (nothing is synthesised).
+- **De-doubled high band.** Above 3 kHz the content is aspiration and sibilance, where a duplicate is heard as doubled hiss. Grains are periodically time-reversed, which decorrelates a grain from its own repeat while preserving its magnitude spectrum exactly. **The reversal period tracks the stretch ratio** (`round(alpha)`): at 2× plain alternation, at 4× every fourth grain. This is not a detail — using every third grain at 2× fills the spectral valleys by 3.5 dB and fails the noise gate outright.
+
+It is causal and streaming. Pitch comes from a YIN tracker running per hop rather than from a whole-signal analysis, the crossover is a linear-phase complementary FIR rather than a zero-phase filter, and the grain search reaches only into a bounded look-ahead. Reported latency is `2048/2 + 1.9·Tmax + 128` input samples — **about 46 ms at 48 kHz**, below the `Live` tier's spectral path. Every decision is a function of absolute sample position and that fixed look-ahead, never of how the host chunked its buffers, so the output is bit-identical at any block size from 1 sample upward.
 
 For pure time stretch from **0.97× through 1.05×**, Offline Auto/Voice/Music uses the quality-first multi-resolution renderer. Explicit Offline Rhythm uses an endpoint-anchored, absolute-grid WSOLA renderer for broadband and transient material; if any audible channel is sustained/tonal it safely falls back to multi-resolution. Non-trivial clips shorter than 50 ms also use multi-resolution in every mode, avoiding the pitch shift caused by endpoint interpolation. WSOLA analysis positions cannot accumulate timing drift, transients stay on the uniform map, the head and tail are protected, and every audible channel contributes a separately normalized similarity score. Exactly 1.0× is a bit-identical copy, requested output length is exact, and whole-signal output becomes available after `finish()`.
 
@@ -567,6 +579,7 @@ src/                         engine implementation
   pb_pghi.h                  phase-gradient integration engine
   pb_envelope.h              True Envelope class formant engine
   pb_multires.h              multi-resolution time-stretch engine (offline)
+  pb_voice.h                 pitch-synchronous voice engine (streaming, causal)
   pb_resampler.h             Kaiser-windowed sinc pitch resampler
   pb_fft.h, pb_window.h      FFT wrapper (pffft), window sets
 tools/pbshift_cli/           offline CLI renderer
@@ -582,7 +595,7 @@ third_party/                 vendored dependencies (cloned locally, not tracked)
 - **Broader multi-resolution defaults.** Offline Music now uses the content-adaptive multi-resolution engine by default; expanding that default to more modes remains subject to listening tests.
 - **Streaming multi-resolution.** The multi-resolution path is currently whole-signal (offline). A block-streaming version would bring the chorusing-free quality to real-time inserts.
 - **Per-region content adaptation.** Layout is currently chosen once per signal; per-region (time-varying) detection would let a single track switch layout as it moves between, e.g., a drum fill and a sustained pad.
-- **Voice-specialized engine.** A pitch-synchronous, band-split vocal prototype lives in `benchmarks/v5b_stretch.py`: pitch marks from an F0 tracker, real pitch-period grains placed by a wide correlation search below 3 kHz, and a de-doubled continuous path above it. On our voice material it is the strongest renderer we have at every ratio from 0.5× to 4×, shortening included. It is **not yet the C++ `Voice` path** — porting it is the highest-value open item. Its front end is whole-signal and its grain search looks ahead, so a streaming version needs a causal pitch tracker and a bounded search before it can meet the `Live` latency budget.
+- **Voice pitch shifting.** The pitch-synchronous engine currently serves time stretch; pitch shifts still reach it through the resamplers rather than by resampling the grains themselves, which is the more direct route for large shifts.
 - **Noise-component morphing** — dedicated resynthesis of the noise/ambience component so pads, reverb tails, and textures stay natural at large stretch ratios instead of turning metallic.
 - **Real-time load smoothing** — split-computation scheduling to flatten worst-case per-block cost during pitch shifting.
 - **`Live` latency tier** — asymmetric analysis/synthesis window pair for sub-60 ms operation.
