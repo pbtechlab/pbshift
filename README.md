@@ -127,6 +127,13 @@ On pbshift's internal objective chorusing metric (1–25 Hz amplitude-modulation
 
 ### Processing modes and tiers
 
+| Mode | Material it is for | CLI | Current state |
+|---|---|---|---|
+| `Auto` | unknown / mixed input | *(default)* | picks a layout from spectral flatness and pitch periodicity |
+| `Voice` | speech, vocals | `--voice` | harmonic-locked in its measured range; the pitch-synchronous prototype in `benchmarks/` is ahead of it and not yet ported (see [Roadmap](#roadmap)) |
+| `Music` | mixes, polyphony | `--multi` | event-adaptive synthesis windows; the mix-oriented default |
+| `Rhythm` | drums, percussion | `--rhythm` | continuously short synthesis window; the sharpest attacks we render |
+
 `Config` exposes a mode hint (`Auto` / `Voice` / `Rhythm` / `Music`) and a latency tier (`Live` / `StudioRT` / `Offline`). `StudioRT` is the reference tier. `Music` uses event-adaptive synthesis windows; `Rhythm` keeps the short window active for percussion. `Voice` applies SHIP-style harmonic locking only in its measured 0.9×–1.6× stretch range and uses the coherence-locked kernel outside that range, avoiding the analysis-hop comb found at 2×. `Live` is the implemented low-latency tier.
 
 For pure time stretch from **0.97× through 1.05×**, Offline Auto/Voice/Music uses the quality-first multi-resolution renderer. Explicit Offline Rhythm uses an endpoint-anchored, absolute-grid WSOLA renderer for broadband and transient material; if any audible channel is sustained/tonal it safely falls back to multi-resolution. Non-trivial clips shorter than 50 ms also use multi-resolution in every mode, avoiding the pitch shift caused by endpoint interpolation. WSOLA analysis positions cannot accumulate timing drift, transients stay on the uniform map, the head and tail are protected, and every audible channel contributes a separately normalized similarity score. Exactly 1.0× is a bit-identical copy, requested output length is exact, and whole-signal output becomes available after `finish()`.
@@ -475,15 +482,55 @@ Renders corpus × conditions through every engine executable found in `tools/bin
 engine in.wav out.wav --pitch <semitones> --stretch <out/in ratio> [--formant]
 ```
 
+### 5. Ratio sweep for listening tests — `benchmarks/ratio_sweep.py`
+
+The corpus runner scores; this one prepares material a human can actually judge.
+It renders one signal across a set of ratios through every pbshift mode (and any
+reference engines named in `PBSHIFT_REFERENCES`), sweeping **both directions** —
+lengthening and shortening fail differently, and an engine that holds together
+at 2× can still come apart at 0.5×.
+
+Two rules keep such a comparison honest, and both were added after they changed
+a conclusion:
+
+- **Headroom.** A full-scale master is attenuated to −6 dBFS before it reaches
+  *any* engine. Stretching a 0 dBFS mix can overshoot; without this, an engine
+  that clips internally is scored on the source level rather than on its
+  algorithm.
+- **Loudness.** Every render is normalised to one integrated loudness. A
+  listening comparison is decided by level long before it is decided by quality.
+
+```sh
+python benchmarks/ratio_sweep.py path/to/signal.wav 0.5 0.8 1.25 2.0 4.0
+PBSHIFT_REFERENCES="other=/path/other.exe" python benchmarks/ratio_sweep.py signal.wav
+```
+
 ### Reproducing
 
 ```sh
-# Python 3.11+, numpy / scipy / soundfile
+# Python 3.11+, numpy / scipy / soundfile / pyloudnorm
 cd benchmarks
 python make_corpus.py     # deterministic corpus -> corpus/*.wav
 python run_bench.py       # all engines in tools/bin -> out/results.csv + summary
 python run_bench.py --quick --engines pb   # fast sanity pass, our engine only
 ```
+
+### Reading the percussion numbers
+
+Two of the metrics above carry most of the weight on rhythmic material, and it
+is worth being explicit about what they correspond to perceptually:
+
+- **`onset_precision` (spurious onsets).** A correct time stretch contains the
+  *same number of hits* as its input; every extra detected onset is a hit that
+  got printed twice. This is what a listener describes as an echo, a flam, or
+  simply "you can hear that it was stretched". Count onsets in the source with
+  the refractory window scaled by the stretch ratio, or the comparison flatters
+  whichever engine was measured at the coarser spacing.
+- **`attack_ratio` (10–90 % rise time).** This is the honest transient measure.
+  A peak-to-preceding-RMS ratio looks like a transient metric and is not: under
+  expansion the decay *before* a hit is stretched louder too, so the ratio falls
+  even when the attack itself is untouched, and any engine that leaves gaps in
+  the signal scores well for the wrong reason.
 
 ## Determinism guarantee
 
@@ -535,7 +582,7 @@ third_party/                 vendored dependencies (cloned locally, not tracked)
 - **Broader multi-resolution defaults.** Offline Music now uses the content-adaptive multi-resolution engine by default; expanding that default to more modes remains subject to listening tests.
 - **Streaming multi-resolution.** The multi-resolution path is currently whole-signal (offline). A block-streaming version would bring the chorusing-free quality to real-time inserts.
 - **Per-region content adaptation.** Layout is currently chosen once per signal; per-region (time-varying) detection would let a single track switch layout as it moves between, e.g., a drum fill and a sustained pad.
-- **Voice-specialized engine** — shape-invariant phase processing driven by an F0 tracker, with voiced/unvoiced-aware phase handling, for maximum naturalness on extreme vocal shifts (up to ±24 st).
+- **Voice-specialized engine.** A pitch-synchronous, band-split vocal prototype lives in `benchmarks/v5b_stretch.py`: pitch marks from an F0 tracker, real pitch-period grains placed by a wide correlation search below 3 kHz, and a de-doubled continuous path above it. On our voice material it is the strongest renderer we have at every ratio from 0.5× to 4×, shortening included. It is **not yet the C++ `Voice` path** — porting it is the highest-value open item. Its front end is whole-signal and its grain search looks ahead, so a streaming version needs a causal pitch tracker and a bounded search before it can meet the `Live` latency budget.
 - **Noise-component morphing** — dedicated resynthesis of the noise/ambience component so pads, reverb tails, and textures stay natural at large stretch ratios instead of turning metallic.
 - **Real-time load smoothing** — split-computation scheduling to flatten worst-case per-block cost during pitch shifting.
 - **`Live` latency tier** — asymmetric analysis/synthesis window pair for sub-60 ms operation.
