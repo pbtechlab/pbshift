@@ -57,6 +57,10 @@ add_executable(test_streaming tests/test_streaming.cpp)
 target_link_libraries(test_streaming PRIVATE pbshift)
 add_test(NAME streaming COMMAND test_streaming)
 
+add_executable(test_voice tests/test_voice.cpp)
+target_link_libraries(test_voice PRIVATE pbshift)
+add_test(NAME voice COMMAND test_voice)
+
 add_executable(rt_bench tests/rt_bench.cpp)
 target_link_libraries(rt_bench PRIVATE pbshift)
 

@@ -146,7 +146,24 @@ Three mechanisms, each aimed at one audible defect:
 - **Wide correlation search on the low band (±0.9 period).** When a period must be reused to buy time, a narrow search leaves the copy sitting almost exactly one period from its original — the deepest possible comb, heard as doubling. A wide search lets the reuse land where the waveform actually matches, which costs neither chorus (nothing is blended) nor noise (nothing is synthesised).
 - **De-doubled high band.** Above 3 kHz the content is aspiration and sibilance, where a duplicate is heard as doubled hiss. Grains are periodically time-reversed, which decorrelates a grain from its own repeat while preserving its magnitude spectrum exactly. **The reversal period tracks the stretch ratio** (`round(alpha)`): at 2× plain alternation, at 4× every fourth grain. This is not a detail — using every third grain at 2× fills the spectral valleys by 3.5 dB and fails the noise gate outright.
 
-It is causal and streaming. Pitch comes from a YIN tracker running per hop rather than from a whole-signal analysis, the crossover is a linear-phase complementary FIR rather than a zero-phase filter, and the grain search reaches only into a bounded look-ahead. Reported latency is `2048/2 + 1.9·Tmax + 128` input samples — **about 46 ms at 48 kHz**, below the `Live` tier's spectral path. Every decision is a function of absolute sample position and that fixed look-ahead, never of how the host chunked its buffers, so the output is bit-identical at any block size from 1 sample upward.
+It is causal and streaming. Pitch comes from a YIN tracker running per hop rather than from a whole-signal analysis, the crossover is a linear-phase complementary FIR rather than a zero-phase filter, and the grain search reaches only into a bounded look-ahead. Reported latency is `frame/2 + 1.9·Tmax + 128` input samples — **about 46 ms at 48 kHz**, below the `Live` tier's spectral path. The analysis frame grows with the sample rate so the pitch floor does not drift upward (a fixed 2048-point frame caps the lag search at 94 Hz once you reach 96 kHz).
+
+Every decision is a function of absolute sample position and that fixed look-ahead, never of how the host chunked its buffers, so the output is bit-identical at any block size from 1 sample upward. Getting there took closing three separate holes, all of which an offline prototype hides by construction: the grain schedule anchored on whatever the tracker had reached rather than on its first estimate, synthesis read the newest period estimate instead of the one belonging to the position it was rendering, and a grain's alignment search saw more input the longer it took to run.
+
+**Real-time behaviour.** Both the pitch tracker and the grain search are *spread across calls* rather than run to completion the moment their audio arrives: a frame of YIN is around maxLag × frameLen multiply-adds and a grain's search a few hundred thousand more, so doing either in one block put a 14× spike on top of a low average. Each call now does a share of that work proportional to the audio it was handed — the arithmetic and its order are unchanged, so the output is identical; only *when* the work happens moves.
+
+The budget matters in both directions. It has to exceed the schedule's own rate (about 1.3 alignment candidates per output sample), or synthesis falls a little further behind every block until the source position it still needs has been recycled out of the ring and it starts correlating against unrelated audio — a silent, gradual corruption rather than an obvious failure.
+
+Measured on the corpus generator's stereo signal at 48 kHz (median of five 30-second runs, worst block in steady state, against the block's own real-time budget):
+
+| Host block | 2× | 0.5× | 2× with +7 st |
+|---|---:|---:|---:|
+| 128 | 63 % | 61 % | — |
+| 256 | 48 % | — | — |
+| 512 | 40 % | — | 77 % |
+| 1024 | — | — | 52 % (+12 st) |
+
+At a 64-sample block (a 1.3 ms budget) the engine sits at roughly 100 % and is not recommended; since its own latency is ~46 ms, a buffer that small buys nothing here. Memory is **fixed at about 12 MB** for 48 kHz stereo no matter how long the stream runs — every buffer is a ring sized once at `configure()`, and nothing allocates on the audio thread.
 
 For pure time stretch from **0.97× through 1.05×**, Offline Auto/Voice/Music uses the quality-first multi-resolution renderer. Explicit Offline Rhythm uses an endpoint-anchored, absolute-grid WSOLA renderer for broadband and transient material; if any audible channel is sustained/tonal it safely falls back to multi-resolution. Non-trivial clips shorter than 50 ms also use multi-resolution in every mode, avoiding the pitch shift caused by endpoint interpolation. WSOLA analysis positions cannot accumulate timing drift, transients stay on the uniform map, the head and tail are protected, and every audible channel contributes a separately normalized similarity score. Exactly 1.0× is a bit-identical copy, requested output length is exact, and whole-signal output becomes available after `finish()`.
 
@@ -438,6 +455,7 @@ Every gate below is enforced by an executable test in `tests/` and was passing a
 | Re-render determinism (two runs, same settings) | 0 differing samples | **0 (bit-identical)** |
 
 - `tests/test_core.cpp` — gates 1–3: the analysis/synthesis skeleton must reconstruct a multi-tone input below −120 dB, and the reassignment operators must hit their accuracy targets.
+- `tests/test_voice.cpp` — gates the Voice engine: chunk-independence at five ratios (1-sample, 37-sample, 64, 8192 and one-shot feeds all byte-compared), exact output length including ratios outside the tuned range, a ratio change mid-stream, degenerate inputs (100 samples, pure silence, an empty stream), and 44.1/96 kHz operation.
 - `tests/test_streaming.cpp` — gates 4–5: renders the same stereo signal through four Auto conditions, two Music conditions, Rhythm 2×, and Voice 2× with 64-sample and 8192-sample feeds, then byte-compares outputs and re-renders. It also requires complete target-length output, preserves the Music/Rhythm fine hop across setters, and verifies compression-safe hop recalculation after reset/reconfigure.
 - `tests/rt_bench.cpp` — streams stereo audio in host-sized blocks for 30 s and fails if the worst-case block cost exceeds the real-time budget; the optional fourth argument selects `auto`, `music`, `rhythm`, or `voice` and the result includes reported latency.
 

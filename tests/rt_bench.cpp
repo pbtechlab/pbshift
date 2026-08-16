@@ -18,6 +18,10 @@ int main(int argc, char** argv) {
     const double stretch = argc > 2 ? std::atof(argv[2]) : 1.0;
     const double pitch = argc > 3 ? std::atof(argv[3]) : 7.0;
     const char* mode = argc > 4 ? argv[4] : "auto";
+    // Formant preservation routes some modes back to the spectral path, so it
+    // has to be switchable here or a mode that opts out of that path can never
+    // be measured.
+    const bool formant = argc > 5 ? std::atoi(argv[5]) != 0 : true;
     const int seconds = 30;
 
     pbshift::Config cfg;
@@ -33,7 +37,7 @@ int main(int argc, char** argv) {
     st.configure(cfg);
     st.setTimeStretch(stretch);
     st.setPitchSemitones(pitch);
-    st.setFormantPreserve(true);
+    st.setFormantPreserve(formant);
 
     std::vector<std::vector<float>> in(ch, std::vector<float>(BLOCK));
     std::vector<std::vector<float>> out(ch, std::vector<float>(4 * BLOCK + 64));
@@ -45,7 +49,12 @@ int main(int argc, char** argv) {
     }
 
     const int blocks = seconds * SR / BLOCK;
-    double worst = 0.0, total = 0.0;
+    // Report the steady-state worst separately from the overall worst: priming
+    // is a one-off cost a host pays before audio flows, and averaging it into
+    // the steady-state figure hides which one is actually a problem.
+    const double warmupSec = argc > 6 ? std::atof(argv[6]) : 1.0;
+    const int warmupBlocks = static_cast<int>(warmupSec * SR / BLOCK);
+    double worst = 0.0, total = 0.0, worstSteady = 0.0;
     long long phase = 0;
     for (int b = 0; b < blocks; ++b) {
         for (int c = 0; c < ch; ++c)
@@ -64,14 +73,18 @@ int main(int argc, char** argv) {
         const auto t1 = std::chrono::steady_clock::now();
         const double ms =
             std::chrono::duration<double, std::milli>(t1 - t0).count();
-        if (b > 4 && ms > worst) worst = ms;  // skip warmup
+        if (b > 4 && ms > worst) worst = ms;  // skip the very first blocks
+        if (b > warmupBlocks && ms > worstSteady) worstSteady = ms;
         total += ms;
     }
     const double budget = 1000.0 * BLOCK / SR;
-    std::printf("block=%d mode=%s stretch=%.2f pitch=%+.0f  "
-                "avg=%.3fms worst=%.3fms "
-                "budget=%.2fms  worst-load=%.1f%%  latency in/out=%d/%d\n",
-                BLOCK, mode, stretch, pitch, total / blocks, worst, budget,
-                100.0 * worst / budget, st.inputLatency(), st.outputLatency());
-    return worst < budget ? 0 : 1;
+    std::printf("block=%d mode=%s formant=%d stretch=%.2f pitch=%+.0f  "
+                "avg=%.3fms worst=%.3fms steady=%.3fms "
+                "budget=%.2fms  load worst/steady=%.1f%%/%.1f%%  "
+                "latency in/out=%d/%d\n",
+                BLOCK, mode, formant, stretch, pitch, total / blocks, worst,
+                worstSteady, budget, 100.0 * worst / budget,
+                100.0 * worstSteady / budget, st.inputLatency(),
+                st.outputLatency());
+    return worstSteady < budget ? 0 : 1;
 }
