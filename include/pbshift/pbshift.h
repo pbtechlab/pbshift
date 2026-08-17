@@ -1,5 +1,5 @@
 // pbshift — real-time pitch shift / time stretch library
-// Public API. See docs/ARCHITECTURE.md.
+// Public API. See README.md.
 #pragma once
 #include <memory>
 

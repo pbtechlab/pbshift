@@ -30,8 +30,8 @@ BIN = ROOT / "tools" / "bin"
 
 # name -> (exe, supports_formant_flag). Engine-agnostic: our engine plus any
 # comparison adapter you drop into tools/bin/ as `baseline_<name>.exe` (each must
-# accept the shared CLI convention). The adapters themselves are local-only and
-# not part of this repository; only pbshift ships here.
+# accept the shared CLI convention). Adapters are supplied by the user; only
+# pbshift ships in this repository.
 ENGINE_CANDIDATES = {
     "pb": (BIN / "pbshift.exe", True),  # ours
 }
