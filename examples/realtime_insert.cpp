@@ -5,7 +5,7 @@
 //
 // For a pitch-shift-only insert (stretch == 1, the common plugin case) the
 // engine is latency-compensated: report inputLatency()+outputLatency() to the
-// host for PDC, prime that many output samples once, then it runs 1:1.
+// host for PDC, feed that many silent input samples once, then it runs 1:1.
 //
 // Build (from repo root, after the library is built):
 //   g++ -O2 -std=c++17 -Iinclude examples/realtime_insert.cpp \
@@ -41,24 +41,17 @@ int main() {
         op[c] = out[c].data();
     }
 
-    // Prime: feed silence until `latency` output samples are queued, so that
-    // from the host's view output[n] corresponds to input[n] (minus PDC).
+    // Prime with exactly the reported delay in silent INPUT frames. Retain
+    // their queued output: it supplies the callback reserve and makes the
+    // input-to-output delay equal the value reported to the host.
     std::vector<std::vector<float>> zero(CH, std::vector<float>(BLOCK, 0.0f));
     std::vector<const float*> zp(CH);
     for (int c = 0; c < CH; ++c) zp[c] = zero[c].data();
     int primed = 0;
-    while (st.available() < latency) {
-        st.feed(zp.data(), BLOCK);
-        primed += BLOCK;
-    }
-    std::vector<float> sink(BLOCK);
-    std::vector<float*> skp(CH);
-    for (int c = 0; c < CH; ++c) skp[c] = sink.data();
-    int drop = latency;
-    while (drop > 0) {  // discard the priming latency
-        const int k = std::min(drop, BLOCK);
-        st.read(skp.data(), k);
-        drop -= k;
+    while (primed < latency) {
+        const int n = std::min(BLOCK, latency - primed);
+        st.feed(zp.data(), n);
+        primed += n;
     }
 
     // Steady state: exactly BLOCK in, BLOCK out per callback.

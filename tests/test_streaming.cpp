@@ -2,6 +2,7 @@
 //  1. chunk-size independence: feeding 64 vs 8192 samples per call must
 //     produce bit-identical output (host-buffer independence)
 //  2. re-render determinism: two runs, identical bits
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -228,6 +229,105 @@ int main() {
         if (diff || diff2) ++fails;
     }
 
+    // Low sustained harmonic tone at a deep pitch-down: exercises the
+    // waveform-aligned (period-synchronous) frame path, which reads the input
+    // ring at data-dependent offsets. It must be chunk-independent too.
+    {
+        std::vector<std::vector<float>> saw(ch, std::vector<float>(n));
+        for (int i = 0; i < n; ++i) {
+            double v = 0.0;
+            for (int h = 1; h <= 40; ++h)
+                v += std::sin(2.0 * 3.14159265358979 * 110.0 * h * i / SR) / h;
+            saw[0][i] = static_cast<float>(0.3 * v);
+            saw[1][i] = static_cast<float>(0.25 * v);
+        }
+        auto a = render(saw, 64, 1.0, -24.0, SR, Config::Mode::Auto);
+        auto b = render(saw, 8192, 1.0, -24.0, SR, Config::Mode::Auto);
+        auto c1 = render(saw, 1, 1.0, -24.0, SR, Config::Mode::Auto);
+        size_t diff = 0;
+        for (int c = 0; c < ch; ++c)
+            for (size_t i = 0; i < a[c].size(); ++i)
+                if (a[c][i] != b[c][i] || a[c][i] != c1[c][i]) ++diff;
+        std::printf("%s aligned low tone pitch=-24 chunk-independence diffs=%zu\n",
+                    diff == 0 ? "PASS" : "FAIL", diff);
+        if (diff) ++fails;
+
+        // At -12 st the harmonics are resolved (55 Hz = 4.7 bins) and the
+        // phase-locked vocoder kept their levels but not their relative
+        // phases (the waveform shape set by the first frames); aligned, the
+        // output must carry the input's shape: phase of harmonic h against h
+        // times the fundamental's equals the sawtooth's (h - 1) * pi / 2.
+        auto d = render(saw, 64, 1.0, -12.0, SR, Config::Mode::Auto);
+        auto e = render(saw, 8192, 1.0, -12.0, SR, Config::Mode::Auto);
+        auto e1 = render(saw, 1, 1.0, -12.0, SR, Config::Mode::Auto);
+        size_t diff12 = 0;
+        for (int c = 0; c < ch; ++c)
+            for (size_t i = 0; i < d[c].size(); ++i)
+                if (d[c][i] != e[c][i] || d[c][i] != e1[c][i]) ++diff12;
+        const double f0 = 55.0;
+        const int L = static_cast<int>(4 * SR / f0);
+        const int i0 = static_cast<int>(d[0].size() / 2) - L / 2;
+        double ph[6] = {};
+        for (int h = 1; h <= 5; ++h) {
+            double re = 0.0, im = 0.0;
+            for (int i = 0; i < L; ++i) {
+                const double w = 0.5 - 0.5 * std::cos(2.0 * kPi * i / L);
+                const double arg = 2.0 * kPi * f0 * h * (i0 + i) / SR;
+                re += w * d[0][i0 + i] * std::cos(arg);
+                im -= w * d[0][i0 + i] * std::sin(arg);
+            }
+            ph[h] = std::atan2(im, re);
+        }
+        double shapeErr = 0.0;
+        for (int h = 2; h <= 5; ++h) {
+            double e2 = ph[h] - h * ph[1] - (h - 1) * kPi / 2.0;
+            e2 -= 2.0 * kPi * std::floor(e2 / (2.0 * kPi) + 0.5);
+            shapeErr = std::max(shapeErr, std::abs(e2));
+        }
+        const bool ok12 = diff12 == 0 && shapeErr < 0.1;
+        std::printf("%s aligned low tone pitch=-12 chunk-independence diffs=%zu "
+                    "harmonic shape error %.3f rad\n",
+                    ok12 ? "PASS" : "FAIL", diff12, shapeErr);
+        if (!ok12) ++fails;
+    }
+
+    // Log sweep at a pitch-down: exercises the gliding-partial (chirp) phase
+    // path, the glide-aware onset gate and the near-DC partial model (the
+    // sweep starts at 20 Hz, i.e. within 1-2 bins of DC in the engine). All
+    // three read only the current/previous analysis frames, so the output
+    // must stay chunk-independent; and the constant-amplitude sweep must
+    // keep its level through the fast upper half (it fell 6-7 dB there
+    // when overlapping grains held the glide at different frequencies).
+    {
+        std::vector<std::vector<float>> sw(ch, std::vector<float>(n));
+        const double k = std::log(1000.0) / 2.0;   // 20 Hz -> 20 kHz in 2 s
+        for (int i = 0; i < n; ++i) {
+            const double t = static_cast<double>(i) / SR;
+            const double v = 0.5 * std::sin(2.0 * kPi * 20.0 * (std::exp(k * t) - 1.0) / k);
+            sw[0][i] = sw[1][i] = static_cast<float>(v);
+        }
+        for (double p : {-12.0, -24.0}) {
+            auto a = render(sw, 64, 1.0, p, SR, Config::Mode::Auto);
+            auto b = render(sw, 8192, 1.0, p, SR, Config::Mode::Auto);
+            auto c1 = render(sw, 1, 1.0, p, SR, Config::Mode::Auto);
+            size_t diff = 0;
+            for (int c = 0; c < ch; ++c)
+                for (size_t i = 0; i < a[c].size(); ++i)
+                    if (a[c][i] != b[c][i] || a[c][i] != c1[c][i]) ++diff;
+            // level of the upper half (0.9 .. 1.8 s) against the input's
+            double eo = 0.0, ei = 0.0;
+            for (int i = SR * 9 / 10; i < SR * 18 / 10; ++i) {
+                eo += static_cast<double>(a[0][i]) * a[0][i];
+                ei += static_cast<double>(sw[0][i]) * sw[0][i];
+            }
+            const double lvl = 10.0 * std::log10((eo + 1e-30) / (ei + 1e-30));
+            const bool ok = diff == 0 && lvl > -2.5 && lvl < 1.0;
+            std::printf("%s log sweep pitch=%+.0f chunk-independence diffs=%zu upper-half level %.2f dB\n",
+                        ok ? "PASS" : "FAIL", p, diff, lvl);
+            if (!ok) ++fails;
+        }
+    }
+
     // The Music/Rhythm path is designed around a hop half the Auto-mode hop.
     // outputLatency() exposes that scheduler choice through the public API and
     // catches accidental reset to N/4 after the normal parameter setters.
@@ -253,7 +353,7 @@ int main() {
     const bool fineHop =
         autoSt.outputLatency() == 2 * autoSt.inputLatency() &&
         musicSt.outputLatency() ==
-            musicSt.inputLatency() + musicSt.inputLatency() / 2 &&
+            musicSt.inputLatency() + musicSt.inputLatency() / 4 + 128 &&
         musicConfiguredLatency == musicStretchLatency &&
         musicStretchLatency == musicSt.outputLatency() &&
         rhythmSt.outputLatency() == musicSt.outputLatency();
@@ -374,6 +474,309 @@ int main() {
     std::printf("%s near-unity pitch preservation f0=%.6f Hz\n",
                 pitchPass ? "PASS" : "FAIL", measuredHz);
     if (!pitchPass) ++fails;
+
+    // Stream edges: a steady tone must stay steady up to both ends (no
+    // half-empty first/last analysis windows, no resampler start/flush fade).
+    // Peak of the first/last 5 ms against the middle, for engine-only
+    // stretch and for pitch up/down (post/pre resampler), both RT tiers.
+    {
+        const int edgeN = SR * 2;
+        std::vector<std::vector<float>> steady(ch,
+                                               std::vector<float>(edgeN));
+        for (int i = 0; i < edgeN; ++i)
+            steady[0][i] = steady[1][i] = static_cast<float>(
+                0.7 * std::sin(2.0 * kPi * 440.0 * i / SR + 0.3));
+        struct EdgeCase { double stretch, pitch; Config::Tier tier; };
+        const EdgeCase edgeCases[] = {
+            {2.0, 0.0, Config::Tier::StudioRT}, {0.5, 0.0, Config::Tier::StudioRT},
+            {1.0, 12.0, Config::Tier::StudioRT}, {1.0, -12.0, Config::Tier::StudioRT},
+            {1.0, -24.0, Config::Tier::StudioRT}, {1.0, 12.0, Config::Tier::Live},
+            {1.5, -7.0, Config::Tier::Live},
+        };
+        for (const auto& ec : edgeCases) {
+            auto y = render(steady, 512, ec.stretch, ec.pitch, SR,
+                            Config::Mode::Auto, ec.tier);
+            const size_t m = y[0].size();
+            auto peak = [&](size_t a, size_t b) {
+                float p = 0.0f;
+                for (size_t i = a; i < b; ++i) p = std::max(p, std::abs(y[0][i]));
+                return p;
+            };
+            const size_t w = SR / 200;  // 5 ms
+            const float mid = peak(m / 2, m / 2 + 2 * w);
+            const float head = peak(0, w);
+            const float tail = peak(m - w, m);
+            const bool ok = head > 0.97f * mid && head < 1.03f * mid &&
+                            tail > 0.97f * mid && tail < 1.03f * mid;
+            std::printf("%s steady-tone edges stretch=%.2f pitch=%+.0f "
+                        "head=%.3f tail=%.3f mid=%.3f\n",
+                        ok ? "PASS" : "FAIL", ec.stretch, ec.pitch, head,
+                        tail, mid);
+            if (!ok) ++fails;
+        }
+    }
+
+    // A fast linear sweep under expansion (pitch up, time stretch): the
+    // gliding-partial phase path must hold it at a constant level (identity-
+    // locked grains beat against each other at the hop rate: a 10 dB ripple),
+    // stay chunk-independent (1/37/8192-sample feeds), and keep its peaks at
+    // the input's. The sweep ends abruptly at full level, as the analytic
+    // test tones do (the stream end must not overshoot either).
+    {
+        const int swN = SR * 2;
+        std::vector<std::vector<float>> sw(ch, std::vector<float>(swN));
+        for (int i = 0; i < swN; ++i) {
+            const double t = static_cast<double>(i) / SR;
+            const double v = 0.5 * std::sin(2.0 * kPi * (50.0 * t + 1500.0 * t * t));
+            sw[0][i] = sw[1][i] = static_cast<float>(v);
+        }
+        struct XCase { double stretch, pitch; };
+        for (const XCase xc : {XCase{1.0, 14.0}, XCase{2.0, 0.0}, XCase{1.6, 0.0}}) {
+            auto a = render(sw, 37, xc.stretch, xc.pitch, SR);
+            auto b = render(sw, 8192, xc.stretch, xc.pitch, SR);
+            auto c1 = render(sw, 1, xc.stretch, xc.pitch, SR);
+            size_t diff = 0;
+            float peak = 0.0f;
+            for (int c = 0; c < ch; ++c)
+                for (size_t i = 0; i < a[c].size(); ++i) {
+                    if (a[c][i] != b[c][i] || a[c][i] != c1[c][i]) ++diff;
+                    peak = std::max(peak, std::abs(a[c][i]));
+                }
+            // 20 ms RMS range over the middle of the file (the sweep stays
+            // below the post resampler's band edge there)
+            const size_t m = a[0].size();
+            const std::vector<float> mid(a[0].begin() + m / 5, a[0].begin() + m / 2);
+            const double range = rmsEnvelopeRangeDb(mid, SR);
+            const bool ok = diff == 0 && range < 1.5 && peak < 0.5f * 1.26f;
+            std::printf("%s linear sweep stretch=%.2f pitch=%+.0f chunk diffs=%zu "
+                        "envelope range %.2f dB peak %.3f\n",
+                        ok ? "PASS" : "FAIL", xc.stretch, xc.pitch, diff, range, peak);
+            if (!ok) ++fails;
+        }
+    }
+
+    // A fast log sweep that ends abruptly at full level (a glide no tail
+    // predictor can continue), under expansion: the frames reaching past the
+    // end must not overshoot (they used to: +5..+13 dB, crossing 0 dBFS at
+    // 2x/4x and +3 st), and the end handling runs only after finish(), so
+    // chunking must not matter.
+    {
+        const int eN = SR * 3 / 2;
+        std::vector<std::vector<float>> sw(1, std::vector<float>(eN));
+        const double k = std::log(600.0) / 1.5;   // 30 Hz -> 18 kHz in 1.5 s
+        for (int i = 0; i < eN; ++i) {
+            const double t = static_cast<double>(i) / SR;
+            sw[0][i] = static_cast<float>(0.7 * std::sin(2.0 * kPi * 30.0 * (std::exp(k * t) - 1.0) / k));
+        }
+        struct ECase { double stretch, pitch; };
+        for (const ECase ec : {ECase{2.0, 0.0}, ECase{4.0, 0.0}, ECase{1.0, 3.0}}) {
+            auto a = render(sw, 37, ec.stretch, ec.pitch, SR);
+            auto b = render(sw, 8192, ec.stretch, ec.pitch, SR);
+            auto c1 = render(sw, 1, ec.stretch, ec.pitch, SR);
+            size_t diff = 0;
+            float peak = 0.0f;
+            for (size_t i = 0; i < a[0].size(); ++i) {
+                if (a[0][i] != b[0][i] || a[0][i] != c1[0][i]) ++diff;
+                peak = std::max(peak, std::abs(a[0][i]));
+            }
+            // At 4x, misreading the falling edge as an attack used to pin
+            // the last real frames to unity and leave the final 50 ms silent.
+            // The constant-amplitude input must retain sound at the tail,
+            // within 6 dB of its sinusoidal RMS, as well as avoid overshoot.
+            const size_t tailEnd = a[0].size() - SR / 50;
+            const size_t tailStart = a[0].size() - SR / 25;
+            double tailEnergy = 0.0;
+            for (size_t i = tailStart; i < tailEnd; ++i)
+                tailEnergy += static_cast<double>(a[0][i]) * a[0][i];
+            const double tailRms = std::sqrt(tailEnergy / (tailEnd - tailStart));
+            const bool tailOk = ec.stretch != 4.0 || tailRms > 0.7 / (2.0 * std::sqrt(2.0));
+            const bool ok = diff == 0 && peak < 0.7f * 1.12f && tailOk;
+            std::printf("%s sweep end stretch=%.2f pitch=%+.0f chunk diffs=%zu peak %.3f "
+                        "tail RMS %.6f (input 0.700)\n",
+                        ok ? "PASS" : "FAIL", ec.stretch, ec.pitch, diff, peak, tailRms);
+            if (!ok) ++fails;
+        }
+    }
+
+    // Uncorrelated stereo: a log sweep on the left, a steady -20 dB tone on
+    // the right. The right tone is a partial the (louder) reference channel
+    // does not carry; it must keep its own phase continuity (it used to take
+    // the rotation of whatever left-channel peak region it fell into: median
+    // -4..-10 dB, 10th percentile -10..-28 dB) for pitch down, pitch up and
+    // stretch, chunk-independently. While the sweep passes the tone's
+    // frequency the two share regions and dips remain (10th percentile).
+    {
+        const int uN = SR * 2;
+        std::vector<std::vector<float>> st(2, std::vector<float>(uN));
+        const double k = std::log(500.0) / 2.0;   // 30 Hz -> 15 kHz in 2 s
+        for (int i = 0; i < uN; ++i) {
+            const double t = static_cast<double>(i) / SR;
+            st[0][i] = static_cast<float>(0.7 * std::sin(2.0 * kPi * 30.0 * (std::exp(k * t) - 1.0) / k));
+            st[1][i] = static_cast<float>(0.07 * std::sin(2.0 * kPi * 330.0 * t));
+        }
+        struct UCase { double stretch, pitch; };
+        for (const UCase uc : {UCase{1.0, -9.0}, UCase{1.0, 3.0}, UCase{0.67, 0.0}}) {
+            auto a = render(st, 37, uc.stretch, uc.pitch, SR);
+            auto b = render(st, 8192, uc.stretch, uc.pitch, SR);
+            auto c1 = render(st, 1, uc.stretch, uc.pitch, SR);
+            size_t diff = 0;
+            for (int c = 0; c < 2; ++c)
+                for (size_t i = 0; i < a[c].size(); ++i)
+                    if (a[c][i] != b[c][i] || a[c][i] != c1[c][i]) ++diff;
+            // right channel: 20 ms RMS of the tone over the middle 60 %,
+            // against the input's 0.07 / sqrt(2); report the median and the
+            // 10th percentile
+            const size_t m = a[1].size();
+            const int win = SR / 50;
+            std::vector<double> lv;
+            for (size_t p = m / 5; p + win < m * 4 / 5; p += win) {
+                double e = 0.0;
+                for (int i = 0; i < win; ++i)
+                    e += static_cast<double>(a[1][p + i]) * a[1][p + i];
+                lv.push_back(10.0 * std::log10(e / win / (0.07 * 0.07 / 2.0) + 1e-30));
+            }
+            std::sort(lv.begin(), lv.end());
+            const double med = lv[lv.size() / 2], p10 = lv[lv.size() / 10];
+            const bool ok = diff == 0 && med > -1.0 && med < 1.0 && p10 > -8.0;
+            std::printf("%s uncorrelated stereo stretch=%.2f pitch=%+.0f chunk diffs=%zu "
+                        "right tone median %.2f dB p10 %.2f dB\n",
+                        ok ? "PASS" : "FAIL", uc.stretch, uc.pitch, diff, med, p10);
+            if (!ok) ++fails;
+        }
+        // the same, gated to exact digital zeros (60 ms on / 20 ms off):
+        // the per-channel phase state across silence and every gate edge
+        // must stay chunk-independent. (The peak is reported only: chopping a
+        // fast glide into bursts sends every frame through the onset gate,
+        // whose overshoot here predates the per-channel state.)
+        std::vector<std::vector<float>> gated = st;
+        for (int i = 0; i < uN; ++i)
+            if ((i % (SR * 80 / 1000)) >= SR * 60 / 1000) gated[0][i] = gated[1][i] = 0.0f;
+        for (const UCase uc : {UCase{1.0, -9.0}, UCase{1.6, 0.0}, UCase{1.0, 5.0}}) {
+            auto a = render(gated, 37, uc.stretch, uc.pitch, SR);
+            auto b = render(gated, 8192, uc.stretch, uc.pitch, SR);
+            auto c1 = render(gated, 1, uc.stretch, uc.pitch, SR);
+            size_t diff = 0;
+            float peak = 0.0f;
+            for (int c = 0; c < 2; ++c)
+                for (size_t i = 0; i < a[c].size(); ++i) {
+                    if (a[c][i] != b[c][i] || a[c][i] != c1[c][i]) ++diff;
+                    peak = std::max(peak, std::abs(a[c][i]));
+                }
+            const bool ok = diff == 0;
+            std::printf("%s gated uncorrelated stereo stretch=%.2f pitch=%+.0f chunk diffs=%zu peak %.3f\n",
+                        ok ? "PASS" : "FAIL", uc.stretch, uc.pitch, diff, peak);
+            if (!ok) ++fails;
+        }
+    }
+
+    // reset() hygiene: a stream rendered after (another stream, reset()) must
+    // be bit-identical to the same stream on a fresh instance. The first
+    // stream leaves every piece of per-stream state behind that the second
+    // one could read: a waveform-aligned run (period history), the formant
+    // estimator's smoothed F0 period, per-channel own-partial phase state,
+    // a glide ending.
+    {
+        const int rN = SR * 3 / 2;
+        auto tone = [&](double f0, double amp, double vib) {
+            std::vector<float> v(rN);
+            double ph = 0.0;
+            for (int i = 0; i < rN; ++i) {
+                const double f = f0 * (1.0 + vib * std::sin(2.0 * kPi * 5.0 * i / SR));
+                ph += 2.0 * kPi * f / SR;
+                double s = 0.0;
+                for (int h = 1; h <= 30; ++h) s += std::sin(h * ph) / h;
+                v[i] = static_cast<float>(amp * s);
+            }
+            return v;
+        };
+        std::vector<float> sweep(rN);
+        {
+            const double k = std::log(500.0) / 1.5;
+            for (int i = 0; i < rN; ++i) {
+                const double t = static_cast<double>(i) / SR;
+                sweep[i] = static_cast<float>(0.6 * std::sin(2.0 * kPi * 30.0 * (std::exp(k * t) - 1.0) / k));
+            }
+        }
+        const std::vector<float> lowSaw = tone(98.0, 0.3, 0.0);
+        const std::vector<float> voiced = tone(140.0, 0.3, 0.01);
+        const std::vector<float> voiced2 = tone(150.0, 0.3, 0.01);
+        struct RCase {
+            std::vector<std::vector<float>> a, b;
+            double stretch, pitch;
+            bool formant;
+            const char* name;
+        };
+        const std::vector<float> quiet = tone(330.0, 0.03, 0.0);
+        const RCase rcases[] = {
+            {{lowSaw, lowSaw}, {sweep, sweep}, 1.0, -12.0, false, "aligned run -> sweep"},
+            {{sweep, sweep}, {lowSaw, lowSaw}, 1.0, -19.0, false, "sweep -> aligned run"},
+            {{voiced, voiced}, {voiced2, voiced2}, 1.0, -12.0, true, "formant F0 history"},
+            {{voiced, voiced}, {voiced2, voiced2}, 1.0, 7.0, true, "formant F0 history up"},
+            {{sweep, quiet}, {voiced, voiced2}, 1.5, 0.0, false, "own-partial channels"},
+            {{sweep, quiet}, {sweep, sweep}, 1.0, 5.0, false, "own-partial -> correlated"},
+        };
+        auto stream = [&](Stretcher& st, const std::vector<std::vector<float>>& in,
+                          double stretch) {
+            const int c2 = static_cast<int>(in.size());
+            const long long len = static_cast<long long>(in[0].size());
+            const long long target = llround(len * stretch);
+            std::vector<std::vector<float>> y(c2, std::vector<float>(target, 0.0f));
+            std::vector<const float*> ip(c2);
+            std::vector<float*> op(c2);
+            long long fed = 0, got = 0;
+            while (fed < len) {
+                const int k = static_cast<int>(std::min<long long>(333, len - fed));
+                for (int c = 0; c < c2; ++c) ip[c] = in[c].data() + fed;
+                st.feed(ip.data(), k);
+                fed += k;
+                int avail = st.available();
+                while (avail > 0 && got < target) {
+                    const int want = static_cast<int>(std::min<long long>(avail, target - got));
+                    for (int c = 0; c < c2; ++c) op[c] = y[c].data() + got;
+                    const int r = st.read(op.data(), want);
+                    if (r <= 0) break;
+                    got += r;
+                    avail = st.available();
+                }
+            }
+            st.finish();
+            while (got < target) {
+                const int avail = st.available();
+                if (avail <= 0) break;
+                const int want = static_cast<int>(std::min<long long>(avail, target - got));
+                for (int c = 0; c < c2; ++c) op[c] = y[c].data() + got;
+                const int r = st.read(op.data(), want);
+                if (r <= 0) break;
+                got += r;
+            }
+            return y;
+        };
+        for (const RCase& rc : rcases) {
+            Config cfg;
+            cfg.sampleRate = SR;
+            cfg.channels = 2;
+            cfg.mode = Config::Mode::Auto;
+            Stretcher reused, fresh;
+            for (Stretcher* s : {&reused, &fresh}) {
+                s->configure(cfg);
+                s->setTimeStretch(rc.stretch);
+                s->setPitchSemitones(rc.pitch);
+                s->setFormantPreserve(rc.formant);
+            }
+            stream(reused, rc.a, rc.stretch);
+            reused.reset();
+            const auto y1 = stream(reused, rc.b, rc.stretch);
+            const auto y2 = stream(fresh, rc.b, rc.stretch);
+            size_t diff = 0;
+            for (int c = 0; c < 2; ++c)
+                for (size_t i = 0; i < y1[c].size(); ++i)
+                    if (std::memcmp(&y1[c][i], &y2[c][i], sizeof(float))) ++diff;
+            std::printf("%s reset-vs-fresh %s stretch=%.2f pitch=%+.0f formant=%d diffs=%zu\n",
+                        diff == 0 ? "PASS" : "FAIL", rc.name, rc.stretch, rc.pitch,
+                        static_cast<int>(rc.formant), diff);
+            if (diff) ++fails;
+        }
+    }
 
     std::vector<std::vector<float>> empty(ch);
     auto emptyOut =

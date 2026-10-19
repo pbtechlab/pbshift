@@ -7,6 +7,11 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+set(SIGNALSMITH_LINEAR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/signalsmith-linear)
+if(NOT EXISTS "${SIGNALSMITH_LINEAR_DIR}/stft.h")
+  message(FATAL_ERROR "Signalsmith Linear is missing. Follow the dependency setup in README.md.")
+endif()
+
 set(PFFFT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pffft)
 
 add_library(pffft_static STATIC
@@ -21,7 +26,7 @@ endif()
 add_library(pbshift STATIC src/pb_engine.cpp)
 target_include_directories(pbshift
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${SIGNALSMITH_LINEAR_DIR})
 target_link_libraries(pbshift PRIVATE pffft_static)
 if(NOT MSVC)
   target_compile_options(pbshift PRIVATE -O2 -Wall -Wextra)
@@ -67,3 +72,21 @@ target_link_libraries(rt_bench PRIVATE pbshift)
 add_executable(realtime_insert examples/realtime_insert.cpp)
 target_link_libraries(realtime_insert PRIVATE pbshift)
 add_test(NAME realtime_insert COMMAND realtime_insert)
+
+add_executable(test_speech_state tests/test_speech_state.cpp)
+target_include_directories(test_speech_state PRIVATE src)
+add_test(NAME speech_state COMMAND test_speech_state)
+
+add_executable(test_resampler_readiness tests/test_resampler_readiness.cpp)
+target_include_directories(test_resampler_readiness PRIVATE src)
+add_test(NAME resampler_readiness COMMAND test_resampler_readiness)
+
+add_executable(test_transient_packets tests/test_transient_packets.cpp)
+target_include_directories(test_transient_packets PRIVATE src include)
+target_link_libraries(test_transient_packets PRIVATE pbshift pffft_static)
+add_test(NAME transient_packets COMMAND test_transient_packets)
+
+add_executable(test_speech_pitch_residue tests/test_speech_pitch_residue.cpp)
+target_include_directories(test_speech_pitch_residue PRIVATE src include ${SIGNALSMITH_LINEAR_DIR})
+target_link_libraries(test_speech_pitch_residue PRIVATE pffft_static)
+add_test(NAME speech_pitch_residue COMMAND test_speech_pitch_residue)

@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "pb_lpc.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -51,6 +53,8 @@ public:
         outBase_ = 0;
         inputFed_ = 0;
         buf_.assign(ch_, {});
+        finished_ = false;
+        tailHist_.clear();
     }
 
     // Push input; internally buffered. in: [channel][frames].
@@ -59,13 +63,39 @@ public:
         for (int c = 0; c < ch_; ++c)
             buf_[c].insert(buf_[c].end(), in[c], in[c] + frames);
         inputFed_ += frames;
+        // bounded copy of the most recent samples, for finish()'s extrapolation
+        if (tailHist_.size() != static_cast<size_t>(ch_)) tailHist_.resize(ch_);
+        for (int c = 0; c < ch_; ++c) {
+            std::vector<float>& h = tailHist_[c];
+            h.insert(h.end(), in[c], in[c] + frames);
+            if (h.size() > 2 * kTailHist)
+                h.erase(h.begin(), h.end() - kTailHist);
+        }
     }
 
     void finish() {
         // pad tail so the last real samples can be interpolated
         if (buf_.size() != static_cast<size_t>(ch_)) buf_.resize(ch_);
-        for (int c = 0; c < ch_; ++c)
-            buf_[c].insert(buf_[c].end(), 2 * taps_, 0.0f);
+        // The pad continues the signal by Burg LPC extrapolation of the last
+        // kTailHist fed samples instead of zeros: a zero pad truncates the sinc
+        // kernel over the last `taps_` samples (the final milliseconds of a
+        // steady tone fade). Only the first taps_ pad samples can influence a
+        // real-signal output; the rest stay zero.
+        std::vector<float> ex(static_cast<size_t>(taps_));
+        for (int c = 0; c < ch_; ++c) {
+            std::vector<float>& b = buf_[c];
+            if (!finished_ && tailHist_.size() == static_cast<size_t>(ch_) &&
+                tailHist_[c].size() >= 64) {
+                const std::vector<float>& h = tailHist_[c];
+                const int n = static_cast<int>(
+                    std::min<size_t>(h.size(), kTailHist));
+                burgExtrapolate(h.data() + (h.size() - n), n, 24, taps_,
+                                ex.data());
+                b.insert(b.end(), ex.begin(), ex.end());
+            }
+            b.insert(b.end(), 2 * taps_, 0.0f);
+        }
+        finished_ = true;
     }
 
     // Produce up to maxOut frames at the given ratio; returns count.
@@ -80,9 +110,17 @@ public:
     // stays continuous and monotonic across the change. With a constant ratio
     // the bases stay 0 and the expression reduces to outCount_/ratio, i.e.
     // output is bit-identical to the fixed-ratio-only implementation.
+    // A stream's interpolation profile is selected before input is buffered.
+    // Preserve it across automation, so unread samples cannot change colour.
+    void setInterpolationCutoff(double cutoff) {
+        if (inputFed_ == 0 && outCount_ == 0) {
+            interpolationCutoff_ = cutoff;
+            memoRatio_ = -1.0;
+        }
+    }
     int process(float* const* out, int maxOut, double ratio) {
         if (buf_.empty() || buf_[0].empty()) return 0;
-        const double cutoff = 0.92 * std::min(1.0, ratio);
+        const double cutoff = (ratio >= 1.0 ? interpolationCutoff_ : 0.92 * ratio);
         if (!(ratio == memoRatio_)) {  // ratio change invalidates the memo
             memoRatio_ = ratio;
             memoIdx_.clear();
@@ -103,6 +141,11 @@ public:
             const double srcAbs = srcPosOf(outCount_, ratio);
             const long long i0 = static_cast<long long>(std::floor(srcAbs));
             if (i0 + taps_ >= avail) break;  // need more input
+            // After finish() the stream ends at the last real input sample:
+            // outputs beyond it would only be the extrapolated/zero pad, and a
+            // downstream stage must not see a cliff right after the real end.
+            if (finished_ && srcAbs > static_cast<double>(inputFed_) - 1.0)
+                break;
             // srcAbs - i0 is exact (both representable, result in [0,1)),
             // so the fractional source phase keys the tap-weight memo
             const int e = memoEntry(srcAbs - static_cast<double>(i0), cutoff);
@@ -176,6 +219,28 @@ public:
         return made;
     }
 
+    // Count only frames process() can produce, including its lookahead and
+    // end-of-signal rules. Preview the same ratio re-anchoring as process().
+    int readyOutputCount(double ratio) const {
+        if (buf_.empty() || buf_[0].empty()) return 0;
+        const long long end = baseIn_ + static_cast<long long>(buf_[0].size());
+        double base = srcBase_;
+        if (ratio != segRatio_ && segRatio_ > 0.0 && outCount_ > outBase_)
+            base += static_cast<double>(outCount_ - outBase_) / segRatio_;
+        auto ready = [&](long long offset) {
+            const double src = ratio == segRatio_ ? srcPosOf(outCount_ + offset, ratio)
+                                                  : base + static_cast<double>(offset) / ratio;
+            return static_cast<long long>(std::floor(src)) + taps_ < end &&
+                   (!finished_ || src <= static_cast<double>(inputFed_) - 1.0);
+        };
+        long long low = 0, high = 2147483647;
+        while (low < high) {
+            const long long mid = low + (high - low + 1) / 2;
+            if (ready(mid - 1)) low = mid; else high = mid - 1;
+        }
+        return static_cast<int>(low);
+    }
+
     int pending() const {
         return buf_.empty() ? 0 : static_cast<int>(buf_[0].size());
     }
@@ -186,11 +251,17 @@ public:
     // land on the same audio the engine's stretch change landed on) uses these
     // to stop `process()` right before that position.
     long long inputFed() const { return inputFed_; }
-    double nextSourcePos(double ratio) const { return srcPosOf(outCount_, ratio); }
+    double nextSourcePos(double ratio) const {
+        if (ratio == segRatio_) return srcPosOf(outCount_, ratio);
+        double position = srcBase_;
+        if (segRatio_ > 0.0 && outCount_ > outBase_)
+            position += static_cast<double>(outCount_ - outBase_) / segRatio_;
+        return position;
+    }
     // How many output frames can be produced before the read position would
     // reach input position `inputLimit` (absolute, in fed frames).
     int outputsBefore(double ratio, long long inputLimit) const {
-        const double from = srcPosOf(outCount_, ratio);
+        const double from = nextSourcePos(ratio);
         // Keep the sinc window fully inside the allowed range: an output frame
         // at source position p reads up to p + taps.
         const double head = static_cast<double>(inputLimit) - static_cast<double>(taps_);
@@ -276,6 +347,7 @@ private:
     static constexpr int kSinN = 16384;
     static constexpr size_t kMemoCap = 64;
     std::vector<double> sinTab_;
+    double interpolationCutoff_ = 0.92;
     double memoRatio_ = -1.0;  // impossible ratio: first process() resets
     std::unordered_map<uint64_t, int> memoIdx_;
     std::vector<std::vector<double>> memoSinc_, memoW_;
@@ -294,6 +366,9 @@ private:
     double srcBase_ = 0.0;    // source position at the start of the segment
     long long outBase_ = 0;   // outCount_ at the start of the segment
     long long inputFed_ = 0;  // absolute input frames handed to feed()
+    bool finished_ = false;
+    static constexpr size_t kTailHist = 1024;
+    std::vector<std::vector<float>> tailHist_;
     std::vector<std::vector<float>> buf_;
 };
 

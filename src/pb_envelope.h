@@ -35,20 +35,40 @@ public:
           order_(order),
           baseOrder_(order),
           sampleRate_(sampleRate),
-          fft_(n_) {
+          fft_(n_),
+          acfFft_(fftSize) {
         logS_.resize(bins_);
         env_.resize(bins_);
         ceps_ = RealFFT::alloc(n_);
+        acf_ = RealFFT::alloc(fftSize);
         spec_.resize(bins_);
+        aspec_.resize(binsFull_);
     }
-    ~TrueEnvelope() { pffft_aligned_free(ceps_); }
+    ~TrueEnvelope() {
+        pffft_aligned_free(ceps_);
+        pffft_aligned_free(acf_);
+    }
     TrueEnvelope(const TrueEnvelope&) = delete;
     TrueEnvelope& operator=(const TrueEnvelope&) = delete;
 
     // Fundamental bin (full grid) detected during the last compute(); 0 if the
-    // frame was not confidently voiced. Callers use it to disable formant
-    // correction below F0 (see formantGains).
+    // frame was not confidently voiced. Callers use it to leave the region
+    // below F0 uncorrected.
     double lastF0Bin() const { return lastF0Bin_; }
+
+    // Per-stream state (the smoothed F0 period that caps the cepstral order):
+    // a new stream must not inherit the previous one's.
+    void reset() {
+        smQuef_ = 0.0;
+        lastF0Bin_ = 0.0;
+    }
+
+    // F0 search range of the signal the envelope is computed on (the engine
+    // moves it with the pre-resampler on pitch-down).
+    void setF0Range(double minHz, double maxHz) {
+        f0MinHz_ = minHz;
+        f0MaxHz_ = maxHz;
+    }
 
     // mag[binsFull] -> envLog[binsFull] (natural-log envelope)
     // orderOverride: cepstral order in FULL-grid units (scaled internally).
@@ -71,31 +91,31 @@ public:
         }
 
         // CRITICAL: the cepstral order MUST stay below the fundamental's
-        // quefrency, or the envelope tracks the harmonics themselves. When
-        // that happens, the formant "correction" re-imposes the INPUT's
-        // harmonic structure on the pitch-shifted output and silently undoes
-        // the pitch shift (measured: sung vowel +12 st f0 unchanged). Cap the
-        // order at 0.7x the detected F0 quefrency (harmonic-safe). Downward
-        // capping is always safe, so no confidence gate is needed.
+        // period, or the envelope tracks the harmonics themselves. When that
+        // happens, the formant "correction" re-imposes the INPUT's harmonic
+        // structure on the pitch-shifted output and silently undoes the pitch
+        // shift (measured: sung vowel +12 st f0 unchanged). Downward capping
+        // is always safe, so no confidence gate is needed.
         {
-            int q0 = detectF0Quefrency(logS_.data());
-            // temporally smooth the quefrency so the order (and hence the
-            // envelope) does not jitter frame-to-frame on vibrato/voiced
-            // transitions — jitter re-introduces the subharmonic ripple.
-            if (q0 > 0) {
-                smQuef_ = smQuef_ > 0.0 ? 0.85 * smQuef_ + 0.15 * q0 : q0;
-                q0 = static_cast<int>(smQuef_ + 0.5);
-            }
-            if (q0 > 0) {
-                // 0.5x the F0 quefrency: the envelope period stays >= 2x the
-                // fundamental period, so env(f*p)/env(f) carries no harmonic
-                // ripple. Looser caps (0.7x) leave residual ripple that
-                // couples harmonic k to 2k and grows an f0/2 subharmonic on
-                // up-shifts (measured: +7 st fund-to-subharmonic gap 14->25 dB).
-                const int cap = std::max(6, q0 / 2);
+            const double lag = detectF0Lag(mag);
+            // Temporal smoothing (order stability on vibrato) in the log
+            // domain, restarted on a jump: averaging across an octave error
+            // or a new note produced a period that belongs to neither (the old
+            // linear EMA of the cepstral pick sat between T0 and 2T0).
+            if (lag > 0.0) {
+                smQuef_ = (smQuef_ > 0.0 && std::abs(std::log(lag / smQuef_)) < 0.12)
+                              ? std::exp(0.7 * std::log(smQuef_) + 0.3 * std::log(lag))
+                              : lag;
+                // 0.5x the F0 period (the shorter of smoothed and current):
+                // the envelope period stays >= 2x the fundamental period, so
+                // env(f*p)/env(f) carries no harmonic ripple. Looser caps
+                // (0.7x) leave residual ripple that couples harmonic k to 2k
+                // and grows an f0/2 subharmonic on up-shifts (measured: +7 st
+                // fund-to-subharmonic gap 14->25 dB).
+                const double T = std::min(lag, smQuef_);
+                const int cap = std::max(6, static_cast<int>(T / (2.0 * sub_)));
                 if (cap < order_) order_ = cap;
-                // full-grid fundamental bin = fftSize / quefrency(full-rate)
-                lastF0Bin_ = static_cast<double>(nFull_) / (q0 * sub_);
+                lastF0Bin_ = nFull_ / lag;   // full-grid fundamental bin
             } else {
                 lastF0Bin_ = 0.0;
             }
@@ -129,24 +149,49 @@ public:
     }
 
 private:
-    // Cepstral fundamental quefrency (in sub-grid samples) from the log
-    // spectrum, restricted to the voice range (F0 70-500 Hz). Returns 0 if no
-    // clear periodicity (unvoiced / non-harmonic -> no cap needed).
-    int detectF0Quefrency(const float* logSpec) {
-        for (int q = 0; q < bins_; ++q) spec_[q] = {logSpec[q], 0.0f};
-        fft_.inverse(spec_.data(), ceps_);   // real cepstrum (sub-grid rate)
-        const double subRate = static_cast<double>(sampleRate_) / sub_;
-        const int lo = std::max(2, static_cast<int>(subRate / 500.0));
-        const int hi = std::min(n_ / 2 - 1, static_cast<int>(subRate / 70.0));
-        int qpk = 0;
-        float pk = 0.0f;
-        double meanAbs = 0.0;
-        for (int q = lo; q <= hi; ++q) {
-            meanAbs += std::abs(ceps_[q]);
-            if (ceps_[q] > pk) { pk = ceps_[q]; qpk = q; }
+    // Fundamental period (full-rate samples, fractional; 0 = unvoiced) from
+    // the frame's power spectrum: autocorrelation = IFFT(|X|^2), divided by
+    // the analysis window's own autocorrelation (Boersma 1993, the Praat
+    // pitch method). Periodicity in the WAVEFORM is far more robust than the
+    // cepstral peak on voices whose spectrum is one strong fundamental over a
+    // breathy floor (sung vowel: the cepstral pick jumped between T0, 2T0,
+    // 3T0 and T0/2, frame to frame). Octave guard: the SHORTEST lag whose
+    // normalized correlation is within 85% of the best wins, so sub-octave
+    // (2T0) errors -- the harmful direction for both the order cap and the
+    // sub-F0 protection -- are avoided.
+    double detectF0Lag(const float* mag) {
+        for (int m = 0; m < binsFull_; ++m)
+            aspec_[m] = {mag[m] * mag[m], 0.0f};
+        acfFft_.inverse(aspec_.data(), acf_);
+        const double r0 = acf_[0];
+        if (!(r0 > 1e-20)) return 0.0;
+        // circular ACF: keep lags <= N/3 where the wrapped term is < 6%
+        const int lo = std::max(2, static_cast<int>(sampleRate_ / f0MaxHz_));
+        const int hi = std::min(nFull_ / 3,
+                                static_cast<int>(sampleRate_ / f0MinHz_) + 1);
+        if (hi <= lo + 2) return 0.0;
+        // periodic-Hann window autocorrelation (analytic, normalized)
+        auto rw = [&](double t) {
+            const double x = t / nFull_;
+            return (1.0 - x) * (2.0 / 3.0 + std::cos(2.0 * M_PI * x) / 3.0) +
+                   std::sin(2.0 * M_PI * x) / (2.0 * M_PI);
+        };
+        auto nr = [&](int t) { return acf_[t] / (r0 * rw(t)); };
+        double best = 0.0;
+        for (int t = lo; t <= hi; ++t) {
+            const double v = nr(t);
+            if (v > best && v >= nr(t - 1) && v >= nr(t + 1)) best = v;
         }
-        meanAbs /= std::max(1, hi - lo + 1);
-        return (pk > 2.5 * meanAbs) ? qpk : 0;
+        if (best < 0.45) return 0.0;   // Praat's voicing threshold
+        for (int t = lo; t <= hi; ++t) {
+            const double v = nr(t), a = nr(t - 1), b = nr(t + 1);
+            if (v >= 0.85 * best && v >= a && v >= b) {
+                const double den = a - 2.0 * v + b;
+                const double d = den < 0.0 ? 0.5 * (a - b) / den : 0.0;
+                return t + std::clamp(d, -0.5, 0.5);
+            }
+        }
+        return 0.0;
     }
 
     // cepstral low-pass: keep quefrency bins [0, order_]
@@ -166,36 +211,35 @@ private:
 
     int nFull_, binsFull_, sub_, n_, bins_, order_, baseOrder_, sampleRate_;
     double lastF0Bin_ = 0.0;
-    double smQuef_ = 0.0;  // EMA-smoothed F0 quefrency (order stability)
+    double smQuef_ = 0.0;  // log-EMA-smoothed F0 period (order stability)
+    double f0MinHz_ = 60.0, f0MaxHz_ = 1100.0;
     RealFFT fft_;
+    RealFFT acfFft_;
     std::vector<float> logS_, env_;
-    std::vector<std::complex<float>> spec_;
+    std::vector<std::complex<float>> spec_, aspec_;
     float* ceps_;
+    float* acf_;
 };
 
-// Formant corrector: desired(f) = env_in(f * p), gain clamped to +-30 dB.
+// Formant corrector: desired(f) = env_in(f * p), gain clamped to +15/-30 dB.
 // strength in [0,1] scales the correction: full correction is measured best
 // for upshift and mild downshift, but over-corrects (artifacts) at deep
 // downshift where partial/no correction scores higher perceived quality.
-// f0Bin: fundamental bin of the (engine-internal) signal, or <=0 if unknown.
-// Below the fundamental there is no meaningful envelope, so a naive
-// desired=env(f*p) samples the strong signal region while the current value
-// is the sub-F0 noise floor -> a huge upward gain that amplifies the floor
-// into a spurious tone (measured: voice +12 st grew a phantom partial at the
-// ORIGINAL pitch, masking the shift). Below f0 the gain is forced to 1.
+// The region below the fundamental has no envelope to restore; the caller
+// (Stretcher stageFormant) leaves it uncorrected.
 inline void formantGains(const std::vector<float>& envLog, double p,
-                         std::vector<float>& gain, float strength = 1.0f,
-                         double f0Bin = 0.0) {
+                         std::vector<float>& gain, float strength = 1.0f) {
     const int B = static_cast<int>(envLog.size());
     gain.resize(B);
     // Asymmetric clamp: cuts are safe (they only attenuate existing content),
     // but large BOOSTS amplify floor/noise into spurious tones. Cap boost at
-    // +9 dB, allow cut to -30 dB.
-    const float limUp = 1.036f;    // ln(9 dB)
+    // +15 dB, allow cut to -30 dB. +9 dB could not lift the envelope back up
+    // at -12 st (the region above the moved-down formants sits >10 dB low):
+    // speech formants stayed a full octave down (pbACC FR-FORMANT -1220 c),
+    // +15 dB restores them (-23 c) without raising NISQA noisiness.
+    const float limUp = 1.727f;    // ln(15 dB)
     const float limDn = -3.4539f;  // ln(30 dB)
-    const int f0lo = f0Bin > 1.0 ? static_cast<int>(0.85 * f0Bin) : 0;
     for (int m = 0; m < B; ++m) {
-        if (m < f0lo) { gain[m] = 1.0f; continue; }  // sub-F0: no correction
         const double q = m * p;
         const int q0 = static_cast<int>(q);
         float desired;

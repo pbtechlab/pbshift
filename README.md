@@ -8,7 +8,7 @@
 
 A real-time **pitch-shifting / time-stretching C++ library**, engineered so that harmonic purity, transient sharpness, natural formants, and bit-exact reproducibility all hold at once — none traded off against the others.
 
-- **C++17 static library**, zero external runtime dependencies (pffft is used at build time under a BSD-like license)
+- **C++17 static library**, zero external runtime dependencies (pffft and Signalsmith Linear are build dependencies; see the license notices)
 - **Streaming pull API** (`feed` → `available` → `read`, `finish` to flush) for real-time inserts and offline rendering alike
 - **Pitch ±24 semitones**, **time-stretch 0.25×–4×** (wider values are accepted and clamped internally), independent and combinable
 - **Automatable while streaming**: `setPitchSemitones()` / `setTimeStretch()` may be called between `feed()` calls, so a host can follow a pitch envelope without splitting the signal into segments — the read position is re-anchored at the change, and the output-side ratio is applied where that audio actually reaches the output, so a pitch ramp does not drag the material out of time
@@ -43,7 +43,7 @@ A real-time **pitch-shifting / time-stretching C++ library**, engineered so that
 
 Time-scale modification classically forces a trade-off: harmonic purity **or** sharp transients **or** natural formants **or** reproducible renders. pbshift is engineered so that none of these degrade the others:
 
-- A single shared analysis front-end feeds every sub-engine — there are no parallel processing chains that can drift apart in gain or phase.
+- The native paths share an analysis front-end. Extreme speech processing also uses a synchronized auxiliary path with phase alignment and a gradual handover.
 - Transients are handled as sparse, time-domain events rather than being smeared through the spectral pipeline.
 - All stochastic components are **position-seeded**, so randomness never breaks reproducibility.
 - The bypass path (stretch 1.0, pitch 0) is held to a strict null-test gate from the first commit — the engine cannot silently color the signal.
@@ -163,7 +163,7 @@ Measured on the corpus generator's stereo signal at 48 kHz (median of five 30-se
 | 512 | 40 % | — | 77 % |
 | 1024 | — | — | 52 % (+12 st) |
 
-At a 64-sample block (a 1.3 ms budget) the engine sits at roughly 100 % and is not recommended; since its own latency is ~46 ms, a buffer that small buys nothing here. Memory is **fixed at about 12 MB** for 48 kHz stereo no matter how long the stream runs — every buffer is a ring sized once at `configure()`, and nothing allocates on the audio thread.
+At a 64-sample block (a 1.3 ms budget) the engine sits at roughly 100 % and is not recommended; since its own latency is ~46 ms, a buffer that small buys nothing here. The native Voice path uses **about 12 MB** for 48 kHz stereo regardless of stream length — every buffer is a ring sized once at `configure()`, and nothing allocates on the audio thread.
 
 For pure time stretch from **0.97× through 1.05×**, Offline Auto/Voice/Music uses the quality-first multi-resolution renderer. Explicit Offline Rhythm uses an endpoint-anchored, absolute-grid WSOLA renderer for broadband and transient material; if any audible channel is sustained/tonal it safely falls back to multi-resolution. Non-trivial clips shorter than 50 ms also use multi-resolution in every mode, avoiding the pitch shift caused by endpoint interpolation. WSOLA analysis positions cannot accumulate timing drift, transients stay on the uniform map, the head and tail are protected, and every audible channel contributes a separately normalized similarity score. Exactly 1.0× is a bit-identical copy, requested output length is exact, and whole-signal output becomes available after `finish()`.
 
@@ -395,17 +395,33 @@ multires vowel.wav vowel_slow.wav --stretch 1.5 --voice
 
 The same engine is the default for `Config::Tier::Offline` + `Config::Mode::Music`. Setting `PBSHIFT_MULTIRES` before `configure()` opts other Offline modes into it; `Config::Mode::Voice` then selects the voiced layout. Formant-preserving requests fall back to the streaming path. Pitch shifting still runs through the internal resamplers.
 
+### Extreme speech processing
+
+Upward speech pitch processing no longer leaves an entire weakly voiced frame at its original pitch. It estimates spectral phase coherence, transposes the coherent component, and preserves the complementary aperiodic component for consonants and breath. Peak mapping uses instantaneous frequency to reduce multiplied frequency errors. Both components use the original full-spectrum formant envelope. This adds computation and history, but no lookahead or change to reported latency.
+
+At +24 semitones, an independent 96-condition noisy-harmonic backend test reduced original-key detections from 77 to 16, with no newly failing cases; seven cases still missed the strict target-line criterion. This is a reduction in residual original pitch, not a guarantee of artifact-free conversion. All 3,032 compatibility renders were unchanged outside ten eligible upward Auto/formant-preserving cases. Those ten cases had no new verified pbACC failures and mean FLMOS increased from 2.109 to 2.116. Raw source-reference similarity and unverified noise scores can decrease: pbACC marks source-reference FR-QUAL as `judged=false` for pitch changes and NISQA-NOI as unverified in that domain. They remain recorded as advisory metrics; known pitch-matched references are required to judge target similarity. Legacy raw acceptance results are not relabeled as passes.
+
+The upward speech path uses 16 overlapping analysis windows, conservative voiced-frame detection, and a finer formant envelope. Once speech is recognized, its classification persists through short phonetic changes and resets after 200 ms below the observed peak energy by 40 dB. Per-frame pitch reliability and attack protection still control routing.
+
+In Auto mode with formant preservation, 44.1 and 48 kHz speech can use an auxiliary processor when the native analysis window is at least 2048 samples. Routing requires strong periodicity, changing pitch and spectral shape, and resolved source harmonics; it is determined by the audio content.
+
+For large upward shifts at stretch 1, a modified Signalsmith Stretch backend preserves unvoiced components and uses a longer effective analysis window than the native pitch path. Eligibility requires at least twice the native frequency resolution, including the sample-rate scaling. At time stretch 3.5×–4× and pitch 0, phase-aligned pitch-synchronous waveform fitting can recover sections where the native output loses periodicity. Recovery requires an independently periodic alternative. Other sections continue through the native path. Transitions use a 20 ms fade with shared channel timing.
+
+Auto speech processing reserves additional working buffers. Queued audio, control history, and unread pitch metadata can grow when input is supplied faster than output is read; drain output regularly for real-time use. The auxiliary path keeps the existing latency and output length. Changing pitch, stretch, or formant controls abandons the auxiliary path for the remainder of the stream; `reset()` permits fresh classification. A source pitch contour remains available until the corresponding output is read, including when a host supplies a long input before reading.
+
 ## Building
 
 ### Requirements
 
 - **CMake ≥ 3.20**
 - A **C++17** compiler. Verified: MinGW-w64 GCC 15.1 on Windows. (MSVC configuration paths exist in the CMake script; MinGW is the tested toolchain.)
-- The engine's only shipped third-party dependency: **pffft** (BSD-like license), vendored under `third_party/` (not tracked in git):
+- Build dependencies: **pffft** (BSD-like license) and **Signalsmith Linear** (MIT), placed under `third_party/` (not tracked in git). A modified MIT-licensed Signalsmith Stretch implementation is included in `src/pb_speech_spectrum.h`:
 
 ```sh
 cd third_party
 git clone --depth 1 https://github.com/marton78/pffft.git
+git clone https://github.com/Signalsmith-Audio/linear.git signalsmith-linear
+git -C signalsmith-linear checkout de55e6a50ffcf6f8f43f649692d94691c7025151
 ```
 
 ### Configure and build
@@ -424,6 +440,7 @@ Targets produced:
 | `pbshift_cli` | Offline CLI renderer → `tools/bin/pbshift[.exe]` (statically linked on MinGW) |
 | `test_core` | Core correctness gates (see below) |
 | `test_streaming` | Streaming determinism gates |
+| `test_speech_state` | Long-input pitch-contour retention, release, and reset |
 | `rt_bench` | Real-time viability benchmark |
 
 Notes:
@@ -435,7 +452,7 @@ Notes:
 
 ```sh
 cd build
-ctest            # runs core + streaming + real-time insert
+ctest            # runs core, streaming, voice, real-time insert, and speech state
 # or directly:
 ./test_core
 ./test_streaming
@@ -576,7 +593,8 @@ This property is a hard CI gate, not a best-effort behavior — your offline bou
 
 - Latency is **fixed** for a given configuration and reported in samples via `inputLatency()` / `outputLatency()` — feed these to your host's plugin delay compensation.
 - The default **Studio-RT** tier uses a 4096-point analysis window at 48 kHz. `Auto`/`Voice` use a 1024-sample synthesis hop; `Music`/`Rhythm` use the finer 512-sample hop.
-- Reported PDC is `input = N/2`, `output = N/2 + 2*hs`. At 48 kHz this is about **128 ms total** for StudioRT Auto/Voice and **106.7 ms** for StudioRT Music/Rhythm; Live is about **64 ms** and **53.3 ms**, respectively.
+- Spectral PDC is `input = N/2`. Auto without formant preservation retains `output = N/2 + 2*hs` for attack pinning. Other spectral paths use `output = N/2 + hs + 128`, including a reserve for sinc resampling. At 48 kHz, Auto with formant preservation reports **109.3 ms** in StudioRT and **56 ms** in Live; StudioRT Music/Rhythm reports **98.7 ms**. Auto without formant preservation remains **128 ms** / **64 ms**. These values use the standard hop; compression can refine it. The time-domain Voice path reports its own latency.
+- `available()` counts samples the resampler can actually produce, including lookahead, queued ratio changes, and the end of the signal. For a fixed-rate insert, prime with the reported input-plus-output latency in silent input frames and retain the queued output. Time stretching uses the pull API because transient handling can vary output availability within a stream.
 - Designed tiers (`Config::Tier`):
 
 | Tier | Design point | Status |
@@ -598,6 +616,8 @@ src/                         engine implementation
   pb_envelope.h              True Envelope class formant engine
   pb_multires.h              multi-resolution time-stretch engine (offline)
   pb_voice.h                 pitch-synchronous voice engine (streaming, causal)
+  pb_speech_*.h              content-gated extreme-speech processing and spectrum backend
+  pb_prepared_queue.h        retained analysis/control queues
   pb_resampler.h             Kaiser-windowed sinc pitch resampler
   pb_fft.h, pb_window.h      FFT wrapper (pffft), window sets
 tools/pbshift_cli/           offline CLI renderer
@@ -622,5 +642,22 @@ third_party/                 vendored dependencies (cloned locally, not tracked)
 ## License and credits
 
 - **License:** pbshift is open-source software released under the [MIT License](LICENSE).
-- **Third-party dependency:** [pffft](https://github.com/marton78/pffft) (BSD-like FFTPACK-derived license) is used for FFTs. It retains its own copyright and license; see [Third-party notices](THIRD_PARTY_NOTICES.md). No other audio-processing engine is bundled, linked, or distributed with pbshift.
-- The engine is a cleanroom implementation built from published research and our own measurements.
+- **Third-party dependency:** [pffft](https://github.com/marton78/pffft) (BSD-like FFTPACK-derived license) is used for FFTs. It retains its own copyright and license; see [Third-party notices](THIRD_PARTY_NOTICES.md). The extreme-speech pitch path includes a modified [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch) 1.3.2 implementation (MIT, commit `a670068d9aeb64913331d5cc29337b19a457a7df`) and uses [Signalsmith Linear](https://github.com/Signalsmith-Audio/linear) (MIT).
+- The native engine is based on published research and our own measurements; the attributed speech spectrum backend is derived from Signalsmith Stretch. Full third-party license texts are retained.
+
+
+### Native interpolation bandwidth
+
+Streams started with formant preservation off in Auto, Music or Rhythm use an interpolation cutoff at 93.6% of Nyquist (previously 92%). The 64 one-sided taps and Kaiser beta 12 stay the same; decimation retains its existing anti-alias filter. This preserves more high-frequency detail on downward pitch shifts without adding lookahead. The profile is selected before the stream buffers input and stays fixed through automation; reset selects it again from the current settings. Voice and formant-preserving streams retain their existing profile.
+
+The change passed the fixed pbACC per-case guards on the 308-case primary matrix, 528-case secondary matrix, 460-case external matrix and the additional 200-case pitch/time grid, including downward steps from -0.5 to -24 semitones. Eight unused utterances from known speakers at 44.1/48 kHz added 224 safety checks; they do not demonstrate an independent improvement. A separate 512-case coherent-sine audit measured unwanted interpolation images below -120 dB; an overly wide filter was rejected by the same audit. This update improves native downward-pitch processing; further time-stretch quality work is ongoing.
+
+### Isolated transients in Offline Music
+
+Music mode in the Offline tier retimes short, isolated decaying sounds by moving their peak anchors and retaining the original samples and inter-channel timing. It preserves a compact hit's attack and decay rather than depositing it through several overlapping spectral frames. This applies to pure time stretching (`pitch = 0`) in the existing whole-signal renderer.
+
+The complete signal must have at least 50% exact digital silence. Events separated by less than 12 ms are grouped; each group must last at most 80 ms, reach its peak within 20 ms, and, for groups longer than 10 ms, have the last fifth's RMS no greater than one quarter of the peak. A continuous background, sustained/long event, target collision or boundary truncation selects the regular multi-resolution renderer. Quiet background samples are retained, without noise-floor removal, gain adjustment or a limiter.
+
+A separate 540-condition test covered six sample rates (8–48 kHz), mono/stereo signals, four transient families and six kinds of compatibility control, at length ratios 0.25, 0.5, 0.75, 0.9, 1, 1.1, 1.25, 2 and 4. All 258 admitted outputs matched their known waveform targets sample for sample; all 282 protected cases matched the previous renderer's WAV. With the validated pbACC clock, mean FR-QUAL on the 270 known-event targets increased from 4.275 to 4.695 without a new per-case regression. The remaining cases are compatibility checks, not subjective-quality references. This does not certify arbitrary music or speech time stretching.
+
+Use `pbshift input.wav output.wav --multi --tier offline --stretch 4`. Reproduce the controlled comparison with `python benchmarks/transient_quality_check.py --exe path/to/new/pbshift.exe --baseline path/to/previous/pbshift.exe --pbacc path/to/pbacc.exe --out local/transient-check` (NumPy and SoundFile). Every source, target, raw result and compatibility case is retained.

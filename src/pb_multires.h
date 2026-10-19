@@ -147,6 +147,89 @@ public:
         return best;
     }
 
+    // Short, isolated decaying events keep their waveform and stereo timing.
+    // Retiming their peak anchors avoids printing the same transient through
+    // several overlapping spectral frames. Any background, sustained event,
+    // target collision or edge truncation retains the regular renderer.
+    static bool isolatedTransientStretch(
+        const std::vector<std::vector<float>>& in, double ratio, int sampleRate,
+        std::vector<std::vector<float>>& out) {
+        if (in.empty() || in[0].empty() || sampleRate <= 0 ||
+            !(ratio > 0.0) || !std::isfinite(ratio)) return false;
+        const long long length = static_cast<long long>(in[0].size());
+        for (const auto& channel : in)
+            if (channel.size() != in[0].size()) return false;
+        const long long target = std::llround(length * ratio);
+        if (target <= 0) return false;
+        const long long quietGap = std::max(1LL, std::llround(.012 * sampleRate));
+        const long long maxEvent = std::max(1LL, std::llround(.080 * sampleRate));
+        auto active = [&](long long at) {
+            for (const auto& channel : in)
+                if (channel[size_t(at)] != 0.0f) return true;
+            return false;
+        };
+        // Exact digital silence only: a quiet background is never removed.
+        long long silent = 0;
+        for (long long i = 0; i < length; ++i) {
+            bool audible = false;
+            for (const auto& channel : in) {
+                const float value = channel[size_t(i)];
+                if (!std::isfinite(value)) return false;
+                audible = audible || value != 0.0f;
+            }
+            if (!audible) ++silent;
+        }
+        if (silent < length - silent) return false;
+        struct Event { long long begin, end, output; };
+        std::vector<Event> events;
+        long long position = 0, previousEnd = 0;
+        while (position < length) {
+            while (position < length && !active(position)) ++position;
+            if (position == length) break;
+            const long long begin = position;
+            long long last = position;
+            while (++position < length) {
+                if (active(position)) last = position;
+                else if (position - last >= quietGap) break;
+            }
+            const long long end = last + 1;
+            if (end - begin > maxEvent) return false;
+            double peak = 0.0;
+            long long anchor = begin;
+            for (long long i = begin; i < end; ++i) {
+                double value = 0.0;
+                for (const auto& channel : in)
+                    value = std::max(value, std::abs(double(channel[size_t(i)])));
+                if (value > peak) { peak = value; anchor = i; }
+            }
+            if (anchor - begin > std::llround(.020 * sampleRate)) return false;
+            double peakEnergy = 0.0;
+            for (const auto& channel : in)
+                peakEnergy += double(channel[size_t(anchor)]) * channel[size_t(anchor)];
+            if (end - begin > std::llround(.010 * sampleRate)) {
+                const long long tail = std::max(1LL, (end - begin) / 5);
+                double energy = 0.0;
+                for (long long i = end - tail; i < end; ++i)
+                    for (const auto& channel : in)
+                        energy += double(channel[size_t(i)]) * channel[size_t(i)];
+                if (energy / tail > peakEnergy * .0625) return false;
+            }
+            const long long start = std::llround(anchor * ratio) - (anchor - begin);
+            if (start < previousEnd || start < 0 || start + (end - begin) > target)
+                return false;
+            events.push_back({begin, end, start});
+            previousEnd = start + (end - begin);
+        }
+        if (events.empty()) return false;
+        out.assign(in.size(), std::vector<float>(size_t(target), 0.0f));
+        for (const auto& event : events)
+            for (size_t channel = 0; channel < in.size(); ++channel)
+                std::copy(in[channel].begin() + event.begin,
+                          in[channel].begin() + event.end,
+                          out[channel].begin() + event.output);
+        return true;
+    }
+
     // --- multi-channel API (reference-channel phase lock) -------------------
     std::vector<std::vector<float>> process(
         const std::vector<std::vector<float>>& in, double ratio) {

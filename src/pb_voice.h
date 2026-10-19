@@ -325,7 +325,38 @@ private:
 
     void filterAvailable() {
         const long long limit = inCount_ - kFirTaps;
+        const double* h = fir_.data();
         for (; filtered_ <= limit; ++filtered_) {
+            if (filtered_ + 3 <= limit) {
+                const long long p = filtered_;
+                for (int c = 0; c < ch_; ++c) {
+                    const Ring<float>& r = in_[c];
+                    double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                    for (int i = 0; i < kFirTaps; ++i) {
+                        const double hi = h[i];
+                        a0 += hi * r.at(p + i);
+                        a1 += hi * r.at(p + 1 + i);
+                        a2 += hi * r.at(p + 2 + i);
+                        a3 += hi * r.at(p + 3 + i);
+                    }
+                    const double acc[4] = {a0, a1, a2, a3};
+                    for (int k = 0; k < 4; ++k) {
+                        low_[c].at(p + k) = acc[k];
+                        high_[c].at(p + k) = r.at(p + k + kFirTaps / 2) - acc[k];
+                    }
+                }
+                for (int k = 0; k < 4; ++k) {
+                    double sl = 0.0, sh = 0.0;
+                    for (int c = 0; c < ch_; ++c) {
+                        sl += low_[c].at(p + k);
+                        sh += high_[c].at(p + k);
+                    }
+                    lowMono_.at(p + k) = sl / ch_;
+                    highMono_.at(p + k) = sh / ch_;
+                }
+                filtered_ += 3;
+                continue;
+            }
             for (int c = 0; c < ch_; ++c) {
                 double acc = 0.0;
                 for (int i = 0; i < kFirTaps; ++i)
@@ -415,14 +446,34 @@ private:
     long long stepFrame(long long budget) {
         const int n = frameLen_;
         const int hi = maxLag();
+        const double* x = scratchX_.data();
         long long used = 0;
         while (curLag_ <= hi && used < budget) {
+            const int l0 = curLag_;
+            if (l0 + 3 <= hi && used + 4 <= budget) {
+                double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                const int m = n - (l0 + 3);
+                for (int i = 0; i < m; ++i) {
+                    const double xi = x[i];
+                    const double d0 = xi - x[i + l0];
+                    const double d1 = xi - x[i + l0 + 1];
+                    const double d2 = xi - x[i + l0 + 2];
+                    const double d3 = xi - x[i + l0 + 3];
+                    a0 += d0 * d0; a1 += d1 * d1; a2 += d2 * d2; a3 += d3 * d3;
+                }
+                for (int i = m; i + l0 < n; ++i) { const double d = x[i] - x[i + l0]; a0 += d * d; }
+                for (int i = m; i + l0 + 1 < n; ++i) { const double d = x[i] - x[i + l0 + 1]; a1 += d * d; }
+                for (int i = m; i + l0 + 2 < n; ++i) { const double d = x[i] - x[i + l0 + 2]; a2 += d * d; }
+                scratchD_[l0] = a0; scratchD_[l0 + 1] = a1; scratchD_[l0 + 2] = a2; scratchD_[l0 + 3] = a3;
+                curLag_ += 4; used += 4;
+                continue;
+            }
             double acc = 0.0;
-            for (int i = 0; i + curLag_ < n; ++i) {
-                const double diff = scratchX_[i] - scratchX_[i + curLag_];
+            for (int i = 0; i + l0 < n; ++i) {
+                const double diff = x[i] - x[i + l0];
                 acc += diff * diff;
             }
-            scratchD_[curLag_] = acc;
+            scratchD_[l0] = acc;
             ++curLag_;
             ++used;
         }
